@@ -1,6 +1,3 @@
 streamlit
 matplotlib
 plotly
-email.message
-dotenv
-os
