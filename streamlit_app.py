@@ -11,7 +11,7 @@ st.title("Retirement Simulation App")
 st.sidebar.header("Simulation Settings")
 simulation_start_year = st.sidebar.number_input("Start Year", min_value=2000, max_value=2100, value=2025, step=1, help="Year the simulation begins")
 retirement_year = st.sidebar.number_input("Retirement Year", min_value=2000, max_value=2100, value=2054, step=1, help="Year retirement begins")
-death_year = st.sidebar.number_input("Death Year", min_value=2000, max_value=2100, value=2079, step=1, help="Year the simulation ends")
+death_year = st.sidebar.number_input("End Year", min_value=2000, max_value=2100, value=2079, step=1, help="Year the simulation ends")
 retirement_salary = st.sidebar.number_input(
     "Desired Retirement Salary (Annual, 2024 AUD)",
     value=71723.0 if st.session_state.get('household_size', 2) == 2 else 50962.0,
