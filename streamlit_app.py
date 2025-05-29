@@ -32,9 +32,9 @@ initial_super = st.sidebar.number_input("Initial Super per Person", value=35000.
 initial_salary = st.sidebar.number_input("Initial Salary per Person", value=100000.0, step=1000.0, help="Starting annual salary per person")
 household_size = st.sidebar.selectbox("Household Size", [1, 2], index=1, help="Number of income earners in household", key="household_size")
 salary_sacrifice_annual = st.sidebar.number_input("Annual Salary Sacrifice", value=0.0, step=1000.0, help="Annual pre-tax super contribution")
-mortgage_principal = st.sidebar.number_input("Mortgage Principal", value=328000.0, step=1000.0, help="Initial mortgage loan amount")
+mortgage_principal = st.sidebar.number_input("Mortgage Principal", value=500000.0, step=1000.0, help="Initial mortgage loan amount")
 offset_balance = st.sidebar.number_input("Offset Balance", value=150000.0, step=1000.0, help="Initial balance in mortgage offset account")
-mortgage_payment = st.sidebar.number_input("Monthly Mortgage Payment", value=2200.0, step=100.0, help="Fixed monthly payment towards mortgage")
+mortgage_payment = st.sidebar.number_input("Monthly Mortgage Payment", value=3000.0, step=100.0, help="Fixed monthly payment towards mortgage")
 reserve_target = st.sidebar.number_input("Reserve Target", value=100000.0, step=1000.0, help="Desired cash reserve before paying off mortgage")
 homeowner = st.sidebar.checkbox("Homeowner", value=True, help="Check if household owns a home")
 
