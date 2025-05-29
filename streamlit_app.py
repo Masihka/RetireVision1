@@ -5,7 +5,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 # Title
-st.title("Retirement Simulation App")
+st.title("Retirement Simulation App Created by Masih")
 st.warning(
     "📢 **Disclaimer:** This app is not intended to provide financial advice and has not been validated against real-world case studies. It is for general informational use only."
 )
