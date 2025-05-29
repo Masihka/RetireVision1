@@ -9,6 +9,9 @@ st.title("Retirement Simulation App Created by Masih")
 st.warning(
     "📢 **Disclaimer:** This app is not intended to provide financial advice and has not been validated against real-world case studies. It is for general informational use only."
 )
+#GithubIcon {
+  visibility: hidden;
+}
 
 # Sidebar for Inputs
 st.sidebar.header("Simulation Settings")
