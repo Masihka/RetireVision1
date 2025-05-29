@@ -9,16 +9,7 @@ st.title("Retirement Simulation App Created by Masih")
 st.warning(
     "📢 **Disclaimer:** This app is not intended to provide financial advice and has not been validated against real-world case studies. It is for general informational use only."
 )
-# --- Feedback---
-st.sidebar.header("💬 Feedback")
-feedback = st.sidebar.text_area("Your feedback:")
-if st.sidebar.button("Submit Feedback"):
-    if feedback.strip():
-        st.sidebar.success("Thanks for your feedback!")
-        with open("feedback_log.txt", "a") as f:
-            f.write(feedback + "\n---\n")
-    else:
-        st.sidebar.error("Please enter some feedback before submitting.")
+
 # Sidebar for Inputs
 st.sidebar.header("Simulation Settings")
 simulation_start_year = st.sidebar.number_input("Start Year", min_value=2000, max_value=2100, value=2025, step=1, help="Year the simulation begins")
