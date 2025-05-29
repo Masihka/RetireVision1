@@ -4,14 +4,35 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import plotly.graph_objects as go
 
+# Hide GitHub icon, menu, footer, and header via CSS
+hide_streamlit_ui = """
+<style>
+/* Hide the GitHub icon and viewer badge */
+.css-1jc7ptx, .e1ewe7hr3, .viewerBadge_container__1QSob,
+.styles_viewerBadge__1yB5_, .viewerBadge_link__1S137,
+.viewerBadge_text__1JaDK {
+    display: none;
+}
+
+/* Hide the main hamburger menu */
+#MainMenu {
+    visibility: hidden;
+}
+
+/* Hide footer and header */
+footer { visibility: hidden; }
+header { visibility: hidden; }
+</style>
+"""
+
+st.markdown(hide_streamlit_ui, unsafe_allow_html=True)
+
 # Title
 st.title("Retirement Simulation App Created by Masih")
 st.warning(
     "📢 **Disclaimer:** This app is not intended to provide financial advice and has not been validated against real-world case studies. It is for general informational use only."
 )
-#GithubIcon {
-  visibility: hidden;
-}
+
 
 # Sidebar for Inputs
 st.sidebar.header("Simulation Settings")
