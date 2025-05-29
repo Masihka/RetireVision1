@@ -28,7 +28,7 @@ super_rate = st.sidebar.slider("Super Contribution Rate", 0.0, 0.2, 0.11, step=0
 nominal_mortgage_rate = st.sidebar.slider("Mortgage Rate", 0.0, 0.1, 0.06, step=0.005, help="Nominal annual mortgage interest rate")
 
 st.sidebar.header("Personal Finances")
-initial_super = st.sidebar.number_input("Initial Super per Person", value=35000.0, step=1000.0, help="Starting super balance per household member")
+initial_super = st.sidebar.number_input("Initial Super per Person", value=50000.0, step=1000.0, help="Starting super balance per household member")
 initial_salary = st.sidebar.number_input("Initial Salary per Person", value=100000.0, step=1000.0, help="Starting annual salary per person")
 household_size = st.sidebar.selectbox("Household Size", [1, 2], index=1, help="Number of income earners in household", key="household_size")
 salary_sacrifice_annual = st.sidebar.number_input("Annual Salary Sacrifice", value=0.0, step=1000.0, help="Annual pre-tax super contribution")
