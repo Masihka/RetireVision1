@@ -26,7 +26,7 @@ header { visibility: hidden; }
 """
 
 st.markdown(hide_streamlit_ui, unsafe_allow_html=True)
-
+st.set_page_config(initial_sidebar_state="expanded")
 # Title
 st.title("Retirement Simulation App Created by Masih")
 st.warning(
