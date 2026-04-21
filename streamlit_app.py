@@ -606,33 +606,58 @@ if st.sidebar.button("Run Simulation"):
                 take_home_monthly_nominal = take_home_nominal / 12.0
 
             else:
-                # Retirement phase – pension + drawdowns
+                # Retirement phase – pension + drawdowns.
+                # Strategy:
+                #   1. Compute each person's minimum monthly drawdown.
+                #   2. If minimums already cover the shortfall, each person
+                #      draws their minimum (total may legitimately exceed
+                #      the target – that's how Australian min-drawdown
+                #      rules actually work).
+                #   3. Otherwise, each person draws their minimum PLUS a
+                #      share of the remaining gap proportional to their
+                #      balance (so balances deplete symmetrically).
+                #   4. Only when all super is gone do we tap investments.
                 pension_nominal = calculate_pension(
                     super_balances, investment_balance,
                     inflation_factor, current_age)
                 target_monthly_nominal = (retirement_salary
                                           * inflation_factor / 12.0)
                 remaining_need = target_monthly_nominal - pension_nominal
-                if remaining_need > 0:
+
+                if remaining_need > 0 and sum(super_balances) > 0:
                     drawdown_rate_annual = get_drawdown_rate(current_age)
-                    # Split need across living members (not zero balances).
-                    live_members = [i for i in range(household_size)
-                                    if super_balances[i] > 0]
-                    n_live = max(len(live_members), 1)
-                    for i in range(household_size):
-                        if remaining_need <= 0:
-                            break
-                        min_draw = super_balances[i] * drawdown_rate_annual / 12
-                        need_share = remaining_need / n_live
-                        draw = min(max(min_draw, need_share),
-                                   super_balances[i])
-                        super_withdrawal[i] = draw
-                        super_balances[i] -= draw
-                        remaining_need -= draw
-                    if remaining_need > 0 and investment_balance > 0:
-                        investment_withdrawal = min(remaining_need,
-                                                    investment_balance)
-                        investment_balance -= investment_withdrawal
+                    min_draws = [super_balances[i] * drawdown_rate_annual / 12
+                                 for i in range(household_size)]
+                    total_min = sum(min_draws)
+
+                    if total_min >= remaining_need:
+                        # Minimums alone cover the need (or exceed it).
+                        for i in range(household_size):
+                            draw = min(min_draws[i], super_balances[i])
+                            super_withdrawal[i] = draw
+                            super_balances[i] -= draw
+                        remaining_need = 0
+                    else:
+                        # Take minimums, then split extra by balance share.
+                        extra_need = remaining_need - total_min
+                        total_balance = sum(super_balances)
+                        for i in range(household_size):
+                            if super_balances[i] <= 0:
+                                continue
+                            extra = (extra_need * super_balances[i]
+                                     / total_balance
+                                     if total_balance > 0 else 0.0)
+                            draw = min(min_draws[i] + extra,
+                                       super_balances[i])
+                            super_withdrawal[i] = draw
+                            super_balances[i] -= draw
+                        remaining_need = max(0.0,
+                            remaining_need - sum(super_withdrawal))
+
+                if remaining_need > 0 and investment_balance > 0:
+                    investment_withdrawal = min(remaining_need,
+                                                investment_balance)
+                    investment_balance -= investment_withdrawal
 
             # ---- Saving / mortgage (working phase only) ------------------
             principal_repayment = 0.0
