@@ -949,8 +949,8 @@ st.title("🇦🇺 Retirement & Property Simulator")
 st.caption(
     "A two-tab tool. Tab 1 runs a monthly cashflow retirement simulation with "
     f"Australian tax, super and Age Pension rules current to April {TODAY_YEAR}. "
-    "Tab 2 researches the sale history of any Australian property address using "
-    "Gemini + Google Search. Educational only; not financial advice."
+    "Tab 2 researches the sale history of any Australian property address."
+    "Educational only; not financial advice."
 )
 
 tab1, tab2 = st.tabs(["🏦 Retirement Simulator", "🏠 Home Price Growth"])
