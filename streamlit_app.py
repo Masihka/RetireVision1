@@ -506,11 +506,22 @@ def _render_property_result(address: str, data: dict, da_data: dict | None):
                 text=fdt,
                 hovertemplate="<b>%{x|%d %b %Y}</b><br>$%{y:,.0f}<br>%{text}<extra></extra>",
             ))
+        # Use add_shape + add_annotation instead of add_vline with
+        # annotation_text, which has a known bug on date axes where
+        # plotly tries to sum() datetime objects when positioning the label.
         for ry in reno_years:
-            fig.add_vline(x=datetime(ry, 6, 1), line_width=2,
-                          line_dash="dash", line_color="#f59e0b",
-                          annotation_text=f"🔨 DA {ry}",
-                          annotation_position="top")
+            x_str = f"{int(ry)}-06-01"
+            fig.add_shape(
+                type="line", xref="x", yref="paper",
+                x0=x_str, x1=x_str, y0=0, y1=1,
+                line=dict(color="#f59e0b", width=2, dash="dash"),
+            )
+            fig.add_annotation(
+                x=x_str, y=1.02, xref="x", yref="paper",
+                text=f"🔨 DA {ry}", showarrow=False,
+                font=dict(color="#f59e0b", size=11),
+                xanchor="center", yanchor="bottom",
+            )
         bar_colors = ["#22c55e" if (g is not None and g >= 0) else "#ef4444"
                       for g in cagr_y]
         fig.add_trace(go.Bar(
