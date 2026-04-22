@@ -4,8 +4,7 @@ Australian Retirement Simulation + Home Price Growth Analyser.
 Two tabs in one app:
   1. Retirement Simulator — monthly cashflow sim with AU tax, super and
      Age Pension rules verified as of April 2026 (FY 2025-26).
-  2. Home Price Growth — address-based property sale history research via
-     Google Gemini + Google Search grounding.
+  2. Home Price Growth — address-based intelligent property sale history research.
 
 Run with:   streamlit run retirement_sim.py
 
