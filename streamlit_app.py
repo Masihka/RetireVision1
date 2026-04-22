@@ -4,29 +4,31 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import plotly.graph_objects as go
 
+# FIX #1: set_page_config must be the first Streamlit command.
+st.set_page_config(initial_sidebar_state="expanded")
+
 # Hide GitHub icon, menu, footer, and header via CSS
 hide_streamlit_ui = """
 <style>
-/* Hide the GitHub icon and viewer badge */
+/* Hide the GitHub icon and viewer badge (legacy + current selectors) */
 .css-1jc7ptx, .e1ewe7hr3, .viewerBadge_container__1QSob,
 .styles_viewerBadge__1yB5_, .viewerBadge_link__1S137,
-.viewerBadge_text__1JaDK {
+.viewerBadge_text__1JaDK,
+[data-testid="stDecoration"],
+[data-testid="stToolbar"] {
     display: none;
 }
 
 /* Hide the main hamburger menu */
-#MainMenu {
-    visibility: hidden;
-}
+#MainMenu { visibility: hidden; }
 
 /* Hide footer and header */
 footer { visibility: hidden; }
 header { visibility: hidden; }
 </style>
 """
-
 st.markdown(hide_streamlit_ui, unsafe_allow_html=True)
-st.set_page_config(initial_sidebar_state="expanded")
+
 # Title
 st.title("Retirement Simulation App Created by Masih")
 st.warning(
@@ -39,9 +41,15 @@ st.sidebar.header("Simulation Settings")
 simulation_start_year = st.sidebar.number_input("Start Year", min_value=2000, max_value=2100, value=2025, step=1, help="Year the simulation begins")
 retirement_year = st.sidebar.number_input("Retirement Year", min_value=2000, max_value=2100, value=2054, step=1, help="Year retirement begins")
 death_year = st.sidebar.number_input("End Year", min_value=2000, max_value=2100, value=2079, step=1, help="Year the simulation ends")
+
+# FIX (minor UX): read household_size BEFORE retirement_salary so the default can depend on it.
+household_size = st.sidebar.selectbox("Household Size", [1, 2], index=1, help="Number of income earners in household", key="household_size")
+starting_age = st.sidebar.number_input("Starting Age (Member 1)", min_value=18, max_value=90, value=35, step=1,
+                                       help="Age of the primary member at simulation start (used for pension eligibility)")
+
 retirement_salary = st.sidebar.number_input(
     "Desired Retirement Salary (Annual, 2024 AUD)",
-    value=71723.0 if st.session_state.get('household_size', 2) == 2 else 50962.0,
+    value=71723.0 if household_size == 2 else 50962.0,
     step=1000.0,
     help="Default is ASFA comfortable standard: $71,723 for couples, $50,962 for singles"
 )
@@ -57,7 +65,6 @@ nominal_mortgage_rate = st.sidebar.slider("Mortgage Rate", 0.0, 0.1, 0.06, step=
 st.sidebar.header("Personal Finances")
 initial_super = st.sidebar.number_input("Initial Super per Person", value=50000.0, step=1000.0, help="Starting super balance per household member")
 initial_salary = st.sidebar.number_input("Initial Salary per Person", value=100000.0, step=1000.0, help="Starting annual salary per person")
-household_size = st.sidebar.selectbox("Household Size", [1, 2], index=1, help="Number of income earners in household", key="household_size")
 salary_sacrifice_annual = st.sidebar.number_input("Annual Salary Sacrifice", value=0.0, step=1000.0, help="Annual pre-tax super contribution")
 mortgage_principal = st.sidebar.number_input("Mortgage Principal", value=500000.0, step=1000.0, help="Initial mortgage loan amount")
 offset_balance = st.sidebar.number_input("Offset Balance", value=150000.0, step=1000.0, help="Initial balance in mortgage offset account")
@@ -82,7 +89,7 @@ try:
         threshold = float(threshold) if threshold != 'inf' else float('inf')
         rate = float(rate)
         tax_brackets.append((threshold, rate))
-except:
+except Exception:
     st.sidebar.error("Invalid tax brackets format. Use 'threshold:rate' pairs separated by commas.")
     st.stop()
 
@@ -184,6 +191,12 @@ assets_free_area = st.sidebar.number_input(
     help="Varies by homeowner status and household size"
 )
 assets_taper = st.sidebar.number_input("Assets Taper Rate (Annual per $1000)", value=78.0 / 1000, step=0.01, help="$78 per $1,000 over free area annually")
+deeming_threshold = st.sidebar.number_input(
+    "Deeming Low-Rate Threshold",
+    value=103800.0 if household_size == 2 else 62600.0,
+    step=100.0,
+    help="Combined threshold below which the 0.25% deeming rate applies"
+)
 
 st.sidebar.header("Unemployment Periods")
 unemployment_years = {}
@@ -205,20 +218,33 @@ MIN_DRAWDOWN_RATES = {
 }
 
 # Simulation Logic
-def calculate_tax(income, sacrifice, year, inflation_rates):
+def calculate_tax(income, sacrifice):
+    """
+    FIX #2: Returns tax in nominal dollars for the given nominal income and
+    nominal salary sacrifice. The tax brackets are static 2024 values, so
+    bracket creep is captured naturally via the growing nominal income.
+    The previous version multiplied the result by cumulative inflation,
+    which double-inflated the tax once the caller later deflated it.
+    """
     taxable = max(income - sacrifice, 0)
     tax = 0
+    # Walk the brackets, accumulating tax on each filled slice.
     for i, (threshold, rate) in enumerate(tax_brackets):
+        prev_threshold = tax_brackets[i - 1][0] if i > 0 else 0
         if taxable <= threshold:
-            prev_threshold = tax_brackets[i-1][0] if i > 0 else 0
             tax += (taxable - prev_threshold) * rate
             break
-        if i > 0:
-            tax += (threshold - tax_brackets[i-1][0]) * rate
+        tax += (threshold - prev_threshold) * rate  # FIX: also accumulate on the first bracket
     tax += taxable * medicare_levy
-    lito = 700 if taxable <= 37500 else (700 - 0.05 * (taxable - 37500)) if taxable <= 45000 else (325 - 0.015 * (taxable - 45000)) if taxable <= 66667 else 0
-    tax = max(tax - lito, 0) * np.prod([1 + r for r in inflation_rates[:year + 1]])
-    return tax
+    if taxable <= 37500:
+        lito = 700
+    elif taxable <= 45000:
+        lito = 700 - 0.05 * (taxable - 37500)
+    elif taxable <= 66667:
+        lito = 325 - 0.015 * (taxable - 45000)
+    else:
+        lito = 0
+    return max(tax - lito, 0)
 
 def get_drawdown_rate(age):
     for (min_age, max_age), rate in MIN_DRAWDOWN_RATES.items():
@@ -227,19 +253,28 @@ def get_drawdown_rate(age):
     return 0.14
 
 def calculate_pension(super_balances, investment_balance, year, inflation_rates, current_age):
+    """
+    FIX #3 & #4: Deeming rates are annual, so deemed income is NOT multiplied by 12.
+    The low-rate threshold is applied once to the *combined* financial assets, not
+    separately to each balance.
+    Returns a MONTHLY pension in nominal dollars.
+    """
     if current_age < pension_age:
         return 0
     total_assets = sum(super_balances) + investment_balance
-    deemed_income = 0
-    threshold = 89600.0 if household_size == 2 else 60200.0
-    for balance in super_balances + [investment_balance]:
-        low_rate = min(balance, threshold) * 0.0025
-        high_rate = max(0, balance - threshold) * 0.0225
-        deemed_income += low_rate + high_rate
-    income_test_reduction = max(0, (deemed_income * 12 - income_free_area) * income_taper)
+    # Combined deeming: low rate on assets up to threshold, high rate on the rest.
+    combined = total_assets
+    low_part = min(combined, deeming_threshold)
+    high_part = max(0, combined - deeming_threshold)
+    deemed_income = low_part * 0.0025 + high_part * 0.0225  # annual
+
+    income_test_reduction = max(0, (deemed_income - income_free_area) * income_taper)
     assets_test_reduction = max(0, (total_assets - assets_free_area) * assets_taper)
-    max_pension = (max_pension_couple if household_size == 2 else max_pension_single) * np.prod([1 + r for r in inflation_rates[:year]])
-    return max(0, max_pension - max(income_test_reduction, assets_test_reduction)) / 12
+
+    inflation_to_date = np.prod([1 + r for r in inflation_rates[:year]]) if year > 0 else 1.0
+    max_pension = (max_pension_couple if household_size == 2 else max_pension_single) * inflation_to_date
+    annual_pension = max(0, max_pension - max(income_test_reduction, assets_test_reduction))
+    return annual_pension / 12
 
 # Button to run simulation
 if st.sidebar.button("Run Simulation"):
@@ -249,9 +284,7 @@ if st.sidebar.button("Run Simulation"):
         inflation_rates = [inflation_rate] * (death_year - simulation_start_year)
         wage_growth_rates = [wage_growth_rate] * (death_year - simulation_start_year)
         super_rates = [super_rate] * (death_year - simulation_start_year)
-        monthly_mortgage_rate = (1 + nominal_mortgage_rate) ** (1/12) - 1
-        real_rate = lambda infl: (1 + nominal_investment_rate) / (1 + infl) - 1
-        total_initial_salary = initial_salary * household_size
+        monthly_mortgage_rate = (1 + nominal_mortgage_rate) ** (1 / 12) - 1
 
         monthly_data = {key: [] for key in [
             'expenses', 'income', 'savings', 'offset', 'investment', 'principal_paid',
@@ -259,10 +292,10 @@ if st.sidebar.button("Run Simulation"):
             'salary_sacrifice', 'base_expenses', 'childcare', 'baby_supplies', 'food_kids',
             'clothing_kids', 'healthcare_kids', 'education', 'tertiary', 'extracurricular',
             'misc_kids', 'mortgage', 'super_withdrawal_person1', 'super_withdrawal_person2',
-            'investment_withdrawal'
+            'investment_withdrawal', 'shortfall'
         ]}
         super_balances = [initial_super] * household_size
-        investment_balance = 0
+        investment_balance = 0.0
         mortgage_active = True
         mortgage_payoff_year = None
 
@@ -270,8 +303,12 @@ if st.sidebar.button("Run Simulation"):
             year = m // 12
             month_in_year = m % 12
             current_year = simulation_start_year + year
-            current_age = 35 + year  # Assuming starting age of 35
-            inflation_factor = np.prod([1 + r for r in inflation_rates[:year + 1]]) * (1 + inflation_rates[year]) ** (month_in_year / 12)
+            current_age = starting_age + year  # FIX: use user-supplied starting age
+
+            # FIX #8: inflation_factor must equal 1 at t=0. Use [:year] (not [:year+1]).
+            inflation_factor = (
+                np.prod([1 + r for r in inflation_rates[:year]]) if year > 0 else 1.0
+            ) * (1 + inflation_rates[year]) ** (month_in_year / 12)
 
             pension_nominal = calculate_pension(super_balances, investment_balance, year, inflation_rates, current_age)
             living_expenses = base_expenses_monthly
@@ -301,9 +338,11 @@ if st.sidebar.button("Run Simulation"):
                 mortgage_nominal = mortgage_payment
                 expenses_nominal += mortgage_payment
 
-            super_withdrawal = [0] * household_size
-            investment_withdrawal = 0
-            salary_nominal = sg_contribution = sacrifice_contribution = tax_nominal = take_home_nominal = 0
+            super_withdrawal = [0.0] * household_size
+            investment_withdrawal = 0.0
+            salary_nominal = sg_contribution = sacrifice_contribution = tax_nominal = take_home_nominal = 0.0
+            take_home_monthly_nominal = 0.0
+            shortfall_nominal = 0.0
 
             if year < years_to_retirement:
                 employed = [current_year not in unemployment_years[i] for i in range(household_size)]
@@ -311,13 +350,17 @@ if st.sidebar.button("Run Simulation"):
                 sg_contribution_per_person = salary_nominal_per_person * super_rates[year]
                 max_sacrifice = max(0, max_concessional_cap - sg_contribution_per_person)
                 sacrifice_per_person = min(salary_sacrifice_annual, max_sacrifice)
-                sg_contribution = sum(sg_contribution_per_person * (1 if emp else 0) for emp in employed)
-                sacrifice_contribution = sacrifice_per_person * sum(employed)
+
+                sg_contribution = sum(sg_contribution_per_person for emp in employed if emp)
+                sacrifice_contribution = sacrifice_per_person * sum(1 for emp in employed if emp)
                 tax_nominal = sum(
-                    calculate_tax(salary_nominal_per_person * (1 if emp else 0), sacrifice_per_person * (1 if emp else 0), year, inflation_rates)
+                    calculate_tax(
+                        salary_nominal_per_person if emp else 0,
+                        sacrifice_per_person if emp else 0,
+                    )
                     for emp in employed
                 )
-                salary_nominal = sum(salary_nominal_per_person * (1 if emp else 0) for emp in employed)
+                salary_nominal = sum(salary_nominal_per_person if emp else 0 for emp in employed)
                 take_home_nominal = salary_nominal - tax_nominal - sacrifice_contribution
                 take_home_monthly_nominal = take_home_nominal / 12
             else:
@@ -327,8 +370,9 @@ if st.sidebar.button("Run Simulation"):
                     drawdown_rate = get_drawdown_rate(current_age)
                     for i in range(household_size):
                         min_drawdown = super_balances[i] * drawdown_rate / 12
+                        # Note: max_drawdown cap retained as per original design.
                         max_drawdown = super_balances[i] / 12
-                        need_per_person = remaining_need / (household_size - i)
+                        need_per_person = remaining_need / max(household_size - i, 1)
                         withdrawal = min(max(min_drawdown, need_per_person), max_drawdown)
                         if super_balances[i] >= withdrawal:
                             super_withdrawal[i] = withdrawal
@@ -341,16 +385,29 @@ if st.sidebar.button("Run Simulation"):
                     if remaining_need > 0:
                         investment_withdrawal = min(remaining_need, investment_balance)
                         investment_balance -= investment_withdrawal
+                        remaining_need -= investment_withdrawal
+                    # Any still-unmet need is a shortfall (tracked for transparency).
+                    if remaining_need > 0:
+                        shortfall_nominal = remaining_need
 
-            principal_repayment = savings = 0
+            # Cashflow vs debt/savings handling -----------------------------------------
+            principal_repayment = 0.0
+            savings = 0.0
             if year < years_to_retirement:
+                cash_after_expenses = take_home_monthly_nominal - expenses_nominal
                 if mortgage_active:
                     net_debt = max(mortgage_principal - offset_balance, 0)
                     interest = net_debt * monthly_mortgage_rate
                     principal_repayment = min(mortgage_payment - interest, mortgage_principal)
                     mortgage_principal -= principal_repayment
-                    savings = max(take_home_monthly_nominal - expenses_nominal, 0)
-                    offset_balance += savings
+                    if cash_after_expenses >= 0:
+                        savings = cash_after_expenses
+                        offset_balance += savings
+                    else:
+                        # FIX (minor bug): deficits draw from offset instead of being dropped.
+                        draw = min(offset_balance, -cash_after_expenses)
+                        offset_balance -= draw
+                        shortfall_nominal += (-cash_after_expenses) - draw
                     if (offset_balance - mortgage_principal) >= reserve_target * inflation_factor and mortgage_principal > 0:
                         principal_repayment += mortgage_principal
                         offset_balance -= mortgage_principal
@@ -361,19 +418,32 @@ if st.sidebar.button("Run Simulation"):
                         mortgage_active = False
                         mortgage_payoff_year = current_year + (1 if month_in_year >= 9 else 0)
                 else:
-                    savings = max(take_home_monthly_nominal - expenses_nominal, 0)
+                    if cash_after_expenses >= 0:
+                        savings = cash_after_expenses
+                    else:
+                        # Draw deficit from investment balance if available.
+                        draw = min(investment_balance, -cash_after_expenses)
+                        investment_balance -= draw
+                        shortfall_nominal += (-cash_after_expenses) - draw
+                    # FIX #6: apply investment growth + savings once, only here.
                     investment_balance = investment_balance * (1 + nominal_investment_rate / 12) + savings
-
-            if month_in_year == 0:
-                for i in range(household_size):
-                    total_concessional = ((sg_contribution / household_size + sacrifice_contribution / household_size) * 0.85) if year < years_to_retirement else 0
-                    super_growth = super_balances[i] * nominal_super_growth_rate
-                    super_tax = super_growth * 0.15
-                    super_balances[i] = super_balances[i] + super_growth - super_tax + total_concessional / household_size
-
-            if not mortgage_active and year < years_to_retirement:
+            else:
+                # FIX #7: investment balance still grows in retirement (after withdrawals).
                 investment_balance *= (1 + nominal_investment_rate / 12)
 
+            # Annual super update in January
+            if month_in_year == 0:
+                if year < years_to_retirement:
+                    # FIX #5: per-person contribution after 15% tax, added ONCE per person.
+                    per_person_concessional = (sg_contribution + sacrifice_contribution) / household_size * 0.85
+                else:
+                    per_person_concessional = 0
+                for i in range(household_size):
+                    super_growth = super_balances[i] * nominal_super_growth_rate
+                    super_tax = super_growth * 0.15
+                    super_balances[i] = super_balances[i] + super_growth - super_tax + per_person_concessional
+
+            # Record (deflated to 2024 AUD)
             monthly_data['expenses'].append(expenses_nominal / inflation_factor)
             monthly_data['income'].append((take_home_monthly_nominal + pension_nominal + sum(super_withdrawal) + investment_withdrawal) / inflation_factor)
             monthly_data['savings'].append(savings / inflation_factor)
@@ -400,6 +470,7 @@ if st.sidebar.button("Run Simulation"):
             monthly_data['super_withdrawal_person1'].append(super_withdrawal[0] / inflation_factor)
             monthly_data['super_withdrawal_person2'].append(super_withdrawal[1] / inflation_factor if household_size == 2 else 0)
             monthly_data['investment_withdrawal'].append(investment_withdrawal / inflation_factor)
+            monthly_data['shortfall'].append(shortfall_nominal / inflation_factor)
 
         # Annual Aggregation
         years = [f"{y}-{y+1}" for y in range(simulation_start_year, death_year)]
@@ -461,10 +532,13 @@ if st.sidebar.button("Run Simulation"):
             ('salary_sacrifice', 'Salary Sacrifice', 'Annual Salary Sacrifice (2024 AUD)'),
             ('super_withdrawal_person1', 'Super Withdrawal (Person 1)', 'Annual Super Withdrawal Person 1 (2024 AUD)'),
             ('super_withdrawal_person2', 'Super Withdrawal (Person 2)', 'Annual Super Withdrawal Person 2 (2024 AUD)'),
-            ('investment_withdrawal', 'Investment Withdrawal', 'Annual Investment Withdrawal (2024 AUD)')
+            ('investment_withdrawal', 'Investment Withdrawal', 'Annual Investment Withdrawal (2024 AUD)'),
+            ('shortfall', 'Unmet Cashflow', 'Annual Shortfall (2024 AUD)')
         ]
         for key, label, title in plot_configs:
             if key == 'super_person2' and household_size == 1:
+                continue
+            if key == 'super_withdrawal_person2' and household_size == 1:
                 continue
             fig, ax = plt.subplots(figsize=(12, 6))
             ax.plot(years, annual_data[key], label=label, color='blue')
@@ -481,25 +555,30 @@ if st.sidebar.button("Run Simulation"):
         st.subheader("Summary")
         st.write(f"Mortgage paid off in: {mortgage_payoff_year if mortgage_payoff_year else 'Not paid off'}")
         total_super = annual_data['super_person1'][retirement_start_idx] + (annual_data['super_person2'][retirement_start_idx] if household_size == 2 else 0)
-        st.write(f"Total super at retirement: {total_super:.2f} AUD (2024 dollars)")
-        st.write(f"Investment balance at retirement: {annual_data['investment'][retirement_start_idx]:.2f} AUD (2024 dollars)")
-        st.write(f"Target retirement salary: {retirement_salary:.2f} AUD/year (2024 dollars)")
+        st.write(f"Total super at retirement: {total_super:,.2f} AUD (2024 dollars)")
+        st.write(f"Investment balance at retirement: {annual_data['investment'][retirement_start_idx]:,.2f} AUD (2024 dollars)")
+        st.write(f"Target retirement salary: {retirement_salary:,.2f} AUD/year (2024 dollars)")
+        total_shortfall = sum(annual_data['shortfall'])
+        if total_shortfall > 0:
+            st.error(f"Cumulative shortfall over simulation: {total_shortfall:,.2f} AUD (2024 dollars). The plan does not fully fund the target in some years.")
+        else:
+            st.success("No shortfalls: the plan funds target expenses in every year.")
 
         # Tables
         st.subheader("Annual Expenses Breakdown (2024 AUD)")
         expense_table_data = [
-            [year, f"{annual_data['base_expenses'][i]:.0f}", f"{annual_data['childcare'][i]:.0f}", 
-             f"{annual_data['baby_supplies'][i]:.0f}", f"{annual_data['food_kids'][i]:.0f}", 
-             f"{annual_data['clothing_kids'][i]:.0f}", f"{annual_data['healthcare_kids'][i]:.0f}", 
-             f"{annual_data['education'][i]:.0f}", f"{annual_data['tertiary'][i]:.0f}", 
-             f"{annual_data['extracurricular'][i]:.0f}", f"{annual_data['misc_kids'][i]:.0f}", 
-             f"{annual_data['mortgage'][i]:.0f}", f"{annual_data['super_withdrawal_person1'][i]:.0f}", 
-             f"{annual_data['super_withdrawal_person2'][i]:.0f}", f"{annual_data['investment_withdrawal'][i]:.0f}", 
+            [year, f"{annual_data['base_expenses'][i]:.0f}", f"{annual_data['childcare'][i]:.0f}",
+             f"{annual_data['baby_supplies'][i]:.0f}", f"{annual_data['food_kids'][i]:.0f}",
+             f"{annual_data['clothing_kids'][i]:.0f}", f"{annual_data['healthcare_kids'][i]:.0f}",
+             f"{annual_data['education'][i]:.0f}", f"{annual_data['tertiary'][i]:.0f}",
+             f"{annual_data['extracurricular'][i]:.0f}", f"{annual_data['misc_kids'][i]:.0f}",
+             f"{annual_data['mortgage'][i]:.0f}", f"{annual_data['super_withdrawal_person1'][i]:.0f}",
+             f"{annual_data['super_withdrawal_person2'][i]:.0f}", f"{annual_data['investment_withdrawal'][i]:.0f}",
              f"{annual_data['expenses'][i]:.0f}"]
             for i, year in enumerate(years)
         ]
-        expense_headers = ["Year", "Base Expenses", "Childcare", "Baby Supplies", "Food (Kids)", "Clothing (Kids)", 
-                           "Healthcare (Kids)", "Education", "Tertiary", "Extracurricular", "Misc (Kids)", "Mortgage", 
+        expense_headers = ["Year", "Base Expenses", "Childcare", "Baby Supplies", "Food (Kids)", "Clothing (Kids)",
+                           "Healthcare (Kids)", "Education", "Tertiary", "Extracurricular", "Misc (Kids)", "Mortgage",
                            "Super Withdrawal (Person 1)", "Super Withdrawal (Person 2)", "Investment Withdrawal", "Total Expenses"]
         st.dataframe(pd.DataFrame(expense_table_data, columns=expense_headers))
 
@@ -510,13 +589,13 @@ if st.sidebar.button("Run Simulation"):
              f"{d['super_person2']:.0f}", f"{d['tax']:.0f}", f"{d['pension']:.0f}",
              f"{d['sg_contribution']:.0f}", f"{d['salary_sacrifice']:.0f}",
              f"{d['super_withdrawal_person1']:.0f}", f"{d['super_withdrawal_person2']:.0f}",
-             f"{d['investment_withdrawal']:.0f}"]
+             f"{d['investment_withdrawal']:.0f}", f"{d['shortfall']:.0f}"]
             for y, d in zip(years, [{k: v[i] for k, v in annual_data.items()} for i in range(len(years))])
         ]
         headers = ["Year", "Expenses", "Income", "Savings", "Offset", "Investment", "Principal Paid",
                    "Super (Person 1)", "Super (Person 2)", "Tax", "Pension", "SG Contribution",
                    "Salary Sacrifice", "Super Withdrawal (Person 1)", "Super Withdrawal (Person 2)",
-                   "Investment Withdrawal"]
+                   "Investment Withdrawal", "Shortfall"]
         st.dataframe(pd.DataFrame(table_data, columns=headers))
 
 else:
