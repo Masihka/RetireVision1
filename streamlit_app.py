@@ -71,6 +71,11 @@ offset_balance = st.sidebar.number_input("Offset Balance", value=150000.0, step=
 mortgage_payment = st.sidebar.number_input("Monthly Mortgage Payment", value=3000.0, step=100.0, help="Fixed monthly payment towards mortgage")
 reserve_target = st.sidebar.number_input("Reserve Target", value=100000.0, step=1000.0, help="Desired cash reserve before paying off mortgage")
 homeowner = st.sidebar.checkbox("Homeowner", value=True, help="Check if household owns a home")
+include_investment = st.sidebar.checkbox(
+    "Include investment account",
+    value=True,
+    help="If unchecked, excess savings stay in offset while there is a mortgage, then sit as cash savings (no growth). Super is unaffected."
+)
 
 st.sidebar.header("Tax Settings")
 tax_brackets_input = st.sidebar.text_area(
@@ -426,10 +431,13 @@ if st.sidebar.button("Run Simulation"):
                         investment_balance -= draw
                         shortfall_nominal += (-cash_after_expenses) - draw
                     # FIX #6: apply investment growth + savings once, only here.
-                    investment_balance = investment_balance * (1 + nominal_investment_rate / 12) + savings
+                    # If investment account is disabled, treat the bucket as 0%-growth cash savings.
+                    growth_multiplier = (1 + nominal_investment_rate / 12) if include_investment else 1.0
+                    investment_balance = investment_balance * growth_multiplier + savings
             else:
                 # FIX #7: investment balance still grows in retirement (after withdrawals).
-                investment_balance *= (1 + nominal_investment_rate / 12)
+                if include_investment:
+                    investment_balance *= (1 + nominal_investment_rate / 12)
 
             # Annual super update in January
             if month_in_year == 0:
@@ -499,7 +507,7 @@ if st.sidebar.button("Run Simulation"):
         fig.add_trace(go.Bar(
             x=plot_years,
             y=annual_data['investment_withdrawal'][retirement_start_idx:],
-            name="Investment Income",
+            name="Investment Income" if include_investment else "Cash Savings",
             marker_color='orange'
         ))
         fig.add_trace(go.Bar(
@@ -520,19 +528,24 @@ if st.sidebar.button("Run Simulation"):
         st.plotly_chart(fig, use_container_width=True)
 
         # Original Plots
+        investment_label = "Investments" if include_investment else "Cash Savings"
+        investment_title = "Investment Balance (2024 AUD)" if include_investment else "Cash Savings Balance (2024 AUD)"
+        invest_withdrawal_label = "Investment Withdrawal" if include_investment else "Cash Savings Withdrawal"
+        invest_withdrawal_title = "Annual Investment Withdrawal (2024 AUD)" if include_investment else "Annual Cash Savings Withdrawal (2024 AUD)"
+
         plot_configs = [
             ('expenses', 'Expenses', 'Annual Expenses (2024 AUD)'),
             ('income', 'Income', 'Annual Income (2024 AUD)'),
             ('savings', 'Savings', 'Annual Savings (2024 AUD)'),
             ('super_person1', 'Superannuation (Person 1)', 'Superannuation Balance Person 1 (2024 AUD)'),
             ('super_person2', 'Superannuation (Person 2)', 'Superannuation Balance Person 2 (2024 AUD)'),
-            ('investment', 'Investments', 'Investment Balance (2024 AUD)'),
+            ('investment', investment_label, investment_title),
             ('offset', 'Offset Balance', 'Mortgage Offset Balance (2024 AUD)'),
             ('sg_contribution', 'SG Contribution', 'Annual SG Contribution (2024 AUD)'),
             ('salary_sacrifice', 'Salary Sacrifice', 'Annual Salary Sacrifice (2024 AUD)'),
             ('super_withdrawal_person1', 'Super Withdrawal (Person 1)', 'Annual Super Withdrawal Person 1 (2024 AUD)'),
             ('super_withdrawal_person2', 'Super Withdrawal (Person 2)', 'Annual Super Withdrawal Person 2 (2024 AUD)'),
-            ('investment_withdrawal', 'Investment Withdrawal', 'Annual Investment Withdrawal (2024 AUD)'),
+            ('investment_withdrawal', invest_withdrawal_label, invest_withdrawal_title),
             ('shortfall', 'Unmet Cashflow', 'Annual Shortfall (2024 AUD)')
         ]
         for key, label, title in plot_configs:
@@ -556,7 +569,7 @@ if st.sidebar.button("Run Simulation"):
         st.write(f"Mortgage paid off in: {mortgage_payoff_year if mortgage_payoff_year else 'Not paid off'}")
         total_super = annual_data['super_person1'][retirement_start_idx] + (annual_data['super_person2'][retirement_start_idx] if household_size == 2 else 0)
         st.write(f"Total super at retirement: {total_super:,.2f} AUD (2024 dollars)")
-        st.write(f"Investment balance at retirement: {annual_data['investment'][retirement_start_idx]:,.2f} AUD (2024 dollars)")
+        st.write(f"{'Investment' if include_investment else 'Cash savings'} balance at retirement: {annual_data['investment'][retirement_start_idx]:,.2f} AUD (2024 dollars)")
         st.write(f"Target retirement salary: {retirement_salary:,.2f} AUD/year (2024 dollars)")
         total_shortfall = sum(annual_data['shortfall'])
         if total_shortfall > 0:
