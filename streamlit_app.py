@@ -273,18 +273,23 @@ def _clean_json(text):
 
 
 def _query_gemini(prompt: str, system_instruction: str | None = None,
-                  retries: int = 3) -> str | None:
+                  retries: int = 3, model_override: str | None = None,
+                  max_output_tokens: int = 4096) -> str | None:
     """Call Gemini with Google Search grounding + retry-on-rate-limit."""
     client = _get_gemini_client()
-    model, _ = _detect_gemini_model()
-    if client is None or model is None:
+    if client is None:
         return None
+    model = model_override
+    if model is None:
+        model, _ = _detect_gemini_model()
+        if model is None:
+            return None
 
     search_tool = types.Tool(google_search=types.GoogleSearch())
     cfg = types.GenerateContentConfig(
         tools=[search_tool],
         temperature=0.1,
-        max_output_tokens=4096,
+        max_output_tokens=max_output_tokens,
     )
     if system_instruction:
         cfg.system_instruction = system_instruction
@@ -328,6 +333,166 @@ def fetch_da_records(address: str) -> dict | None:
               "PlanSA, iPlan, etc.) and aggregators.")
     raw = _query_gemini(prompt, system_instruction=DA_SYSTEM_PROMPT)
     return _clean_json(raw)
+
+
+# -------------------------------------------------------------------------
+# DEEP SEARCH — multi-pass strategy to squeeze out every sale record.
+# Each pass targets a different site/angle. Results are merged + deduped.
+# -------------------------------------------------------------------------
+DEEP_SEARCH_PASSES = [
+    (
+        "domain",
+        "Search ONLY domain.com.au for property {addr}. "
+        "Open the property's 'Property history' / 'Sale history' section. "
+        "List EVERY sale listed there — even ones from the 1990s or early 2000s. "
+        "Include withheld prices as null. Also note if it's currently listed."
+    ),
+    (
+        "realestate",
+        "Search ONLY realestate.com.au for property {addr}. "
+        "Find the 'Sold' page or 'Property value' / 'Property timeline' data. "
+        "Return every transaction with date and price (or null if withheld)."
+    ),
+    (
+        "onthehouse",
+        "Search ONLY onthehouse.com.au and propertyvalue.com.au for {addr}. "
+        "These sites often have sales from the 1980s-2000s that newer portals "
+        "don't show. List every transaction found."
+    ),
+    (
+        "statevg",
+        "Search the relevant STATE Valuer-General or land registry records for "
+        "{addr}. In NSW this is the Valuer General / NSW LRS sales database; in "
+        "Victoria use DELWP property sales data; in QLD the Titles Registry; in "
+        "WA Landgate. Return every transaction with date, price and document "
+        "reference if available."
+    ),
+]
+
+
+def _best_model_for_deep_search() -> str | None:
+    """Prefer gemini-2.5-pro for deep search (better at aggregating multiple
+    sources and following long instructions). Fall back to whichever model
+    passed our detection test."""
+    client = _get_gemini_client()
+    if client is None:
+        return None
+    for name in ("gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"):
+        try:
+            client.models.generate_content(
+                model=name, contents="ok",
+                config=types.GenerateContentConfig(max_output_tokens=5),
+            )
+            return name
+        except Exception:
+            continue
+    return None
+
+
+def _merge_sales(lists_of_sales: list[list[dict]]) -> list[dict]:
+    """Merge multiple sales lists from different passes, deduplicating by
+    (rough date, rough price). Preserves the earliest-seen source for each
+    unique sale."""
+    seen: dict[tuple, dict] = {}
+
+    def key_for(sale: dict):
+        d = _parse_sale_date(sale.get("date"))
+        # Round to month for date dedup (different sources round differently)
+        date_key = (d.year, d.month) if d else (None, None)
+        # Round price to nearest $1k for price dedup
+        p = sale.get("price")
+        price_key = round(p / 1000) if p else None
+        return (date_key, price_key)
+
+    for sales in lists_of_sales:
+        for sale in sales or []:
+            k = key_for(sale)
+            # If the same sale already seen, prefer one with a source noted
+            if k not in seen:
+                seen[k] = sale
+            else:
+                existing = seen[k]
+                if not existing.get("source") and sale.get("source"):
+                    seen[k] = sale
+
+    # Sort oldest → newest by parsed date (unparseable at the end)
+    merged = list(seen.values())
+    merged.sort(key=lambda s: (_parse_sale_date(s.get("date")) or datetime.max))
+    return merged
+
+
+def fetch_property_history_deep(address: str, status_writer=None) -> dict | None:
+    """Deep search: 4 separate site-targeted queries, merged and deduped.
+    status_writer is an optional callable (e.g. st.write) that receives
+    progress lines. Deep search does NOT cache — the user explicitly asked
+    for a fresh multi-pass lookup."""
+    model = _best_model_for_deep_search()
+    if model is None:
+        return None
+
+    # Container: start with an empty shell; we'll fill fields from the best pass
+    merged: dict = {
+        "address": address,
+        "property_type": None,
+        "bedrooms": None,
+        "bathrooms": None,
+        "car_spaces": None,
+        "land_area_sqm": None,
+        "year_built": None,
+        "sales": [],
+        "renovations": [],
+        "notes": "",
+        "data_confidence": None,
+        "sources_checked": [],
+    }
+
+    all_sales_lists: list[list[dict]] = []
+
+    for pass_key, pass_template in DEEP_SEARCH_PASSES:
+        if status_writer:
+            status_writer(f"🔎 Deep-search pass: {pass_key}…")
+        prompt = pass_template.format(addr=address)
+        raw = _query_gemini(
+            prompt,
+            system_instruction=HOME_PRICE_SYSTEM_PROMPT,
+            model_override=model,
+            max_output_tokens=8192,
+            retries=2,
+        )
+        parsed = _clean_json(raw) or {}
+        all_sales_lists.append(parsed.get("sales") or [])
+        # Back-fill feature fields from whichever pass has them
+        for field in ("property_type", "bedrooms", "bathrooms", "car_spaces",
+                       "land_area_sqm", "year_built"):
+            if merged[field] in (None, "") and parsed.get(field) not in (None, ""):
+                merged[field] = parsed[field]
+        # Track sources
+        for src in parsed.get("sources_checked") or []:
+            if src and src not in merged["sources_checked"]:
+                merged["sources_checked"].append(src)
+        # Keep the longer/richer note
+        note = parsed.get("notes") or ""
+        if len(note) > len(merged["notes"] or ""):
+            merged["notes"] = note
+        # Small pause between passes so we don't slam the rate limit
+        time.sleep(1.5)
+
+    # Combine and dedupe sales
+    merged["sales"] = _merge_sales(all_sales_lists)
+    if status_writer:
+        status_writer(f"✅ Merged {sum(len(s) for s in all_sales_lists)} raw "
+                       f"records → {len(merged['sales'])} unique sales.")
+
+    # Confidence: high if ≥3 passes returned at least one sale
+    non_empty_passes = sum(1 for s in all_sales_lists if s)
+    if non_empty_passes >= 3:
+        merged["data_confidence"] = "high"
+    elif non_empty_passes >= 2:
+        merged["data_confidence"] = "medium"
+    elif merged["sales"]:
+        merged["data_confidence"] = "low"
+
+    return merged
 
 
 def _parse_sale_date(d) -> datetime | None:
@@ -574,7 +739,7 @@ def _render_property_result(address: str, data: dict, da_data: dict | None):
     # ---- Sources ----
     srcs = data.get("sources_checked") or []
     if srcs:
-        with st.expander(f"📚 Sources checked by Gemini ({len(srcs)})"):
+        with st.expander(f"📚 Sources checked ({len(srcs)})"):
             for s in srcs:
                 st.caption(f"- {s}")
     if sales_null:
@@ -630,16 +795,28 @@ def _render_home_price_tab():
 
     # ---- Input form ----
     with st.form("home_price_form"):
-        col1, col2 = st.columns([4, 1])
-        with col1:
-            address = st.text_input(
-                "Property address",
-                placeholder="e.g. 10 Smith Street, Fitzroy VIC 3065",
-                help="More specific = better results. Include suburb, state and postcode.",
+        address = st.text_input(
+            "Property address",
+            placeholder="e.g. 10 Smith Street, Fitzroy VIC 3065",
+            help="More specific = better results. Include suburb, state and postcode.",
+        )
+        col_a, col_b = st.columns(2)
+        with col_a:
+            check_da = st.checkbox(
+                "Include DA / renovation records", value=True,
+                help="Uses an extra API call; slightly slower."
             )
-        with col2:
-            check_da = st.checkbox("Include DA/renovation records", value=True,
-                                    help="Uses an extra API call; slightly slower.")
+        with col_b:
+            deep_search = st.checkbox(
+                "Deep search (better results, 4× API quota)", value=False,
+                help=(
+                    "Runs 4 separate queries targeting domain, realestate, "
+                    "onthehouse + state Valuer-General records and merges the "
+                    "results. Uses gemini-2.5-pro when available. Bypasses the "
+                    "address cache so you get a fresh lookup. Recommended when "
+                    "the quick search missed older sales."
+                )
+            )
         submitted = st.form_submit_button("🔍 Analyse", type="primary",
                                            use_container_width=True)
 
@@ -649,23 +826,34 @@ def _render_home_price_tab():
             st.warning("Enter an address first.")
             return
         with st.status(f"Analysing {address}…", expanded=True) as status:
-            st.write("🔎 Searching sale history on domain, realestate, onthehouse…")
-            data = fetch_property_history(address)
-            if not data:
+            if deep_search:
+                st.write("🚀 Deep search mode: querying 4 sources separately…")
+                data = fetch_property_history_deep(address, status_writer=st.write)
+            else:
+                st.write("🔎 Searching sale history on domain, realestate, onthehouse…")
+                data = fetch_property_history(address)
+
+            if data is None:
                 status.update(label="❌ Could not retrieve data",
                               state="error", expanded=True)
                 st.error(
                     "Gemini returned no parseable data for that address. "
                     "Try a more specific format (include suburb, state and "
-                    "postcode). If the problem persists your daily quota may "
-                    "be exhausted."
+                    "postcode). If the problem persists your daily quota "
+                    "may be exhausted."
                 )
                 return
+
+            # If the quick search found nothing, hint at deep search
+            sales_count = len([s for s in (data.get("sales") or []) if s.get("price")])
+            if sales_count == 0 and not deep_search:
+                st.write("ℹ️ Quick search found no priced sales — you may want "
+                         "to re-run with **Deep search** enabled.")
 
             da_data = None
             if check_da:
                 st.write("🏗️ Searching DA / renovation records…")
-                time.sleep(1.5)  # gentle with the rate limit
+                time.sleep(1.5)
                 da_data = fetch_da_records(address)
 
             st.write("📊 Computing growth metrics…")
@@ -1636,8 +1824,7 @@ with tab1:
 with tab2:
     st.header("🏠 Australian Home Price Growth Analyser")
     st.caption(
-        "Enter any Australian property address. This tab uses Google Gemini "
-        "(free tier) with Google Search grounding to research the sale history "
+        "Enter any Australian property address. This tab researches the sale history "
         "from sites like domain.com.au, realestate.com.au, onthehouse.com.au "
         "and more. Results are cached for 1 hour per address."
     )
