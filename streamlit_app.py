@@ -516,20 +516,27 @@ def run_sim():
 
     # State
     super_bal = [m["super_bal"] for m in members]
-    # Track when each member enters the pension phase (stops accumulation earnings tax)
     super_in_pension_phase = [False] * household_size
     out_bal = initial_investment
-    offset = offset_balance
     mort = mortgage_principal
     mortgage_live = mort > 0
+    # offset only exists while there's a mortgage. savings is the cash bucket
+    # that replaces it once the mortgage is paid off.
+    if mortgage_live:
+        offset = offset_balance
+        savings = 0.0
+    else:
+        # User entered an 'offset' balance but has no mortgage → treat it as cash savings.
+        offset = 0.0
+        savings = offset_balance
     payoff_year = None
 
-    # Log arrays (stored in today's dollars unless labeled)
+    # Log arrays (stored in start-year dollars unless labeled)
     log = {k: [] for k in [
         "salary", "tax", "take_home", "sg", "sacrifice",
         "expenses_base", "expenses_kids", "expenses_mortgage", "expenses_total",
-        "pension", "super_withdrawal", "outside_withdrawal",
-        "savings_flow", "principal_paid", "offset", "outside_balance",
+        "pension", "super_withdrawal", "outside_withdrawal", "savings_withdrawal",
+        "savings_flow", "principal_paid", "offset", "savings", "outside_balance",
         "super_total", "super_m1", "super_m2",
         "shortfall", "retired_flag",
     ]}
@@ -637,6 +644,7 @@ def run_sim():
         # -----------------------------------------------------------------
         super_wd = [0.0] * household_size
         outside_wd = 0.0
+        savings_wd = 0.0
         shortfall = 0.0
         offset_drawn = 0.0
 
@@ -668,18 +676,26 @@ def run_sim():
                         super_bal[i] -= extra
                 gap = need - take_home_monthly_nom - pension_nom - sum(super_wd)
 
-            # Outside investment next
+            # Cash bucket next — whichever one is active this stage.
+            # Drawing cash before investment preserves growth assets.
+            if mortgage_live:
+                if gap > 0 and offset > 0:
+                    w = min(gap, offset)
+                    offset_drawn = w
+                    offset -= w
+                    gap -= w
+            else:
+                if gap > 0 and savings > 0:
+                    w = min(gap, savings)
+                    savings_wd = w
+                    savings -= w
+                    gap -= w
+
+            # Outside investment last.
             if gap > 0 and out_bal > 0:
                 w = min(gap, out_bal)
                 outside_wd = w
                 out_bal -= w
-                gap -= w
-
-            # Offset / cash last
-            if gap > 0 and offset > 0:
-                w = min(gap, offset)
-                offset_drawn = w
-                offset -= w
                 gap -= w
 
             shortfall = max(0.0, gap)
@@ -688,28 +704,27 @@ def run_sim():
             # Surplus this month — allocate it per user split.
             surplus = -gap
             if mortgage_live:
-                # Offset-first is the typical choice while mortgage is live,
-                # because offset effectively earns the mortgage rate tax-free.
-                # The slider controls how much (if any) is siphoned into investment.
+                # Split between offset (debt reduction) and investment.
                 inv_share = surplus * (savings_alloc_pct / 100.0) if include_investment else 0.0
                 off_share = surplus - inv_share
                 if include_investment:
                     out_bal += inv_share
                 offset += off_share
             else:
-                # No mortgage. Offset becomes a plain cash account.
+                # No mortgage. Split between savings account (cash) and investment.
                 if include_investment:
                     inv_share = surplus * (savings_alloc_pct / 100.0)
                     cash_share = surplus - inv_share
                     out_bal += inv_share
-                    offset += cash_share  # track cash in offset var for continuity
+                    savings += cash_share
                 else:
-                    offset += surplus
+                    savings += surplus
 
         # -----------------------------------------------------------------
         # Early-mortgage-payoff trigger (offset got big enough).
-        # Pay off the remaining principal; leftover above the reserve flows
-        # to investment/cash per the same allocation split.
+        # At payoff: close the offset account. The reserve stays as cash in
+        # the new savings account; anything above the reserve is split per
+        # the user's allocation into investment vs savings.
         # -----------------------------------------------------------------
         if mortgage_live and mort > 0:
             reserve_nom = reserve_target * infl_factor
@@ -719,14 +734,23 @@ def run_sim():
                 mort = 0.0
                 mortgage_live = False
                 payoff_year = year + (1 if mo_idx >= 9 else 0)
+
                 leftover = max(0.0, offset - reserve_nom)
+                # Move the reserve out of offset and into the savings account
+                savings += reserve_nom
+                offset -= reserve_nom
+                # Split the leftover between investment and savings per allocation
                 if leftover > 0:
                     if include_investment:
                         inv_share = leftover * (savings_alloc_pct / 100.0)
                         cash_share = leftover - inv_share
                         out_bal += inv_share
-                        offset -= inv_share  # cash_share stays in offset
-                    # else: leftover already in offset, stay as cash
+                        savings += cash_share
+                    else:
+                        savings += leftover
+                    offset -= leftover
+                # Offset is now closed.
+                offset = 0.0
 
         # -----------------------------------------------------------------
         # Monthly growth on outside investment / cash.
@@ -766,9 +790,11 @@ def run_sim():
         log["pension"].append(dfl(pension_nom))
         log["super_withdrawal"].append(dfl(sum(super_wd)))
         log["outside_withdrawal"].append(dfl(outside_wd))
+        log["savings_withdrawal"].append(dfl(savings_wd))
         log["savings_flow"].append(dfl(max(0, -gap)))
         log["principal_paid"].append(dfl(principal_paid_nom))
         log["offset"].append(dfl(offset))
+        log["savings"].append(dfl(savings))
         log["outside_balance"].append(dfl(out_bal))
         log["super_m1"].append(dfl(super_bal[0]))
         log["super_m2"].append(dfl(super_bal[1]) if household_size == 2 else 0.0)
@@ -792,16 +818,13 @@ if st.sidebar.button("▶ Run simulation", type="primary"):
         flow_keys    = ["salary", "tax", "take_home", "sg", "sacrifice",
                         "expenses_base", "expenses_kids", "expenses_mortgage",
                         "expenses_total", "pension", "super_withdrawal",
-                        "outside_withdrawal", "savings_flow", "principal_paid",
-                        "shortfall"]
-        balance_keys = ["offset", "outside_balance", "super_m1", "super_m2",
-                        "super_total"]
+                        "outside_withdrawal", "savings_withdrawal",
+                        "savings_flow", "principal_paid", "shortfall"]
+        balance_keys = ["offset", "savings", "outside_balance",
+                        "super_m1", "super_m2", "super_total"]
 
         annual = {}
         for k in flow_keys:
-            # Most flows were stored monthly; salary, tax, take_home, sg were
-            # divided by 12 in logging, so to get annual need to multiply by 12
-            # OR sum. We logged monthly equivalents, so sum() gives annual.
             annual[k] = [sum(log[k][i*12:(i+1)*12]) for i in range(n_years)]
         for k in balance_keys:
             annual[k] = [log[k][(i+1)*12 - 1] for i in range(n_years)]
@@ -810,15 +833,16 @@ if st.sidebar.button("▶ Run simulation", type="primary"):
         # ------------------- Summary -------------------
         st.subheader("Summary")
         first_retire_idx = next((i for i, r in enumerate(annual["retired_flag"]) if r), None)
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         col1.metric("Mortgage paid off", f"{payoff_year}" if payoff_year else "Not paid off")
         if first_retire_idx is not None:
-            # Balance just before retirement begins
             pre_idx = max(first_retire_idx - 1, 0)
             col2.metric(f"Super at retirement ({start_year} $)",
                         f"${annual['super_total'][pre_idx]:,.0f}")
-            col3.metric(f"Outside assets at retirement ({start_year} $)",
+            col3.metric(f"Investment at retirement ({start_year} $)",
                         f"${annual['outside_balance'][pre_idx]:,.0f}")
+            col4.metric(f"Cash savings at retirement ({start_year} $)",
+                        f"${annual['savings'][pre_idx]:,.0f}")
 
         total_short = sum(annual["shortfall"])
         if total_short > 0.5:
@@ -834,8 +858,10 @@ if st.sidebar.button("▶ Run simulation", type="primary"):
         st.subheader(f"Balances over time (in {start_year} dollars)")
         fig1 = go.Figure()
         fig1.add_trace(go.Scatter(x=years, y=annual["super_total"], name="Super (both)", mode="lines"))
-        fig1.add_trace(go.Scatter(x=years, y=annual["outside_balance"], name="Outside investment / cash", mode="lines"))
-        fig1.add_trace(go.Scatter(x=years, y=annual["offset"], name="Offset account", mode="lines"))
+        fig1.add_trace(go.Scatter(x=years, y=annual["outside_balance"], name="Investment", mode="lines"))
+        fig1.add_trace(go.Scatter(x=years, y=annual["offset"], name="Offset (pre-payoff)", mode="lines",
+                                  line=dict(dash="dot")))
+        fig1.add_trace(go.Scatter(x=years, y=annual["savings"], name="Savings account (post-payoff)", mode="lines"))
         fig1.update_layout(hovermode="x unified", yaxis_tickprefix="$", yaxis_tickformat=",",
                            height=450, legend=dict(orientation="h", y=1.1))
         st.plotly_chart(fig1, use_container_width=True)
@@ -860,7 +886,8 @@ if st.sidebar.button("▶ Run simulation", type="primary"):
             post = slice(first_retire_idx, None)
             fig3.add_trace(go.Bar(x=years[post], y=annual["pension"][post], name="Age Pension"))
             fig3.add_trace(go.Bar(x=years[post], y=annual["super_withdrawal"][post], name="Super drawdown"))
-            fig3.add_trace(go.Bar(x=years[post], y=annual["outside_withdrawal"][post], name="Outside drawdown"))
+            fig3.add_trace(go.Bar(x=years[post], y=annual["savings_withdrawal"][post], name="Savings drawdown"))
+            fig3.add_trace(go.Bar(x=years[post], y=annual["outside_withdrawal"][post], name="Investment drawdown"))
             fig3.update_layout(barmode="stack", hovermode="x unified",
                                yaxis_tickprefix="$", yaxis_tickformat=",", height=400)
             st.plotly_chart(fig3, use_container_width=True)
@@ -882,13 +909,15 @@ if st.sidebar.button("▶ Run simulation", type="primary"):
                 "Savings flow": annual["savings_flow"],
                 "Principal paid": annual["principal_paid"],
                 "Offset": annual["offset"],
-                "Outside": annual["outside_balance"],
+                "Savings account": annual["savings"],
+                "Investment": annual["outside_balance"],
                 "Super (M1)": annual["super_m1"],
                 "Super (M2)": annual["super_m2"],
                 "Super total": annual["super_total"],
                 "Pension": annual["pension"],
                 "Super withdraw": annual["super_withdrawal"],
-                "Outside withdraw": annual["outside_withdrawal"],
+                "Savings withdraw": annual["savings_withdrawal"],
+                "Investment withdraw": annual["outside_withdrawal"],
                 "Shortfall": annual["shortfall"],
             })
             # Format money columns
