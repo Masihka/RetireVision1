@@ -45,7 +45,7 @@ except ImportError:
 # Paste it between the quotes on the line below and save the file.
 # Leave it empty to hide the Home Price tab's functionality (the tab will
 # show setup instructions instead).
-GEMINI_API_KEY = ""
+GEMINI_API_KEY = "AIzaSyBhJAPk2Z-jRkcTYmu8Un9kwBsv8OylT9o"
 # =========================================================================
 
 # -------------------------------------------------------------------------
