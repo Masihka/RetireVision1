@@ -1,28 +1,58 @@
 """
-Australian Retirement Simulation — comprehensive edition.
+Australian Retirement Simulation + Home Price Growth Analyser.
 
-All default values reflect Australian rules and rates verified as of April 2026
-(FY 2025-26). Every source is cited in the sidebar help text. Every threshold
-used in projections is indexed to inflation so that 50-year-forward results
-remain internally consistent.
+Two tabs in one app:
+  1. Retirement Simulator — monthly cashflow sim with AU tax, super and
+     Age Pension rules verified as of April 2026 (FY 2025-26).
+  2. Home Price Growth — address-based property sale history research via
+     Google Gemini + Google Search grounding.
 
 Run with:   streamlit run retirement_sim.py
+
+Requirements:
+    pip install streamlit numpy pandas plotly google-genai
 
 Disclaimer: educational only, not financial advice. Verify figures against
 ATO, Services Australia and your super fund before making decisions.
 """
 from __future__ import annotations
 
+import json
+import re
+import time
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
+
+# google-genai is only needed for the Home Price Growth tab. If it's not
+# installed, the retirement simulator still works; the other tab shows a
+# friendly install instruction instead of crashing.
+try:
+    from google import genai
+    from google.genai import types
+    GENAI_AVAILABLE = True
+except ImportError:
+    GENAI_AVAILABLE = False
+
+# =========================================================================
+# 🔑  GOOGLE GEMINI API KEY
+# =========================================================================
+# Get a free key at:  https://aistudio.google.com/apikey
+# Paste it between the quotes on the line below and save the file.
+# Leave it empty to hide the Home Price tab's functionality (the tab will
+# show setup instructions instead).
+GEMINI_API_KEY = ""
+# =========================================================================
 
 # -------------------------------------------------------------------------
 # Page config MUST be the first Streamlit call.
 # -------------------------------------------------------------------------
 st.set_page_config(
-    page_title="AU Retirement Simulator",
+    page_title="AU Retirement & Property Simulator",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -109,16 +139,628 @@ ASFA_COMFORTABLE_SINGLE = 54_240
 TODAY_YEAR = 2026  # all "real-dollar" outputs are stated in today's dollars
 
 # =========================================================================
+# GEMINI HELPERS (for the Home Price Growth tab)
+# =========================================================================
+# Free-tier Gemini models to try in order, as of April 2026.
+# gemini-2.0-flash is retired; do not use.
+GEMINI_MODEL_PRIORITY = [
+    "gemini-2.5-flash",       # balanced
+    "gemini-2.5-flash-lite",  # highest free-tier quota
+    "gemini-2.5-pro",         # best quality, lowest quota
+]
+
+HOME_PRICE_SYSTEM_PROMPT = """You are an expert Australian property data researcher.
+You have access to Google Search. When given an Australian property address,
+you MUST search the web to find its complete sale/transaction history.
+
+Search sites like domain.com.au, realestate.com.au, onthehouse.com.au,
+propertyvalue.com.au, allhomes.com.au, and any other Australian property
+data source. Search for the SPECIFIC address provided.
+
+Also look for any Development Applications (DAs), building permits,
+renovation records, or new-build indicators for that address.
+
+RESPOND WITH ONLY VALID JSON — no markdown fences, no backticks, no preamble.
+Use this exact schema:
+
+{
+  "address": "full matched address string",
+  "property_type": "house/unit/townhouse/apartment/land/other",
+  "bedrooms": null or number,
+  "bathrooms": null or number,
+  "car_spaces": null or number,
+  "land_area_sqm": null or number,
+  "year_built": null or number,
+  "sales": [
+    {
+      "date": "YYYY-MM-DD",
+      "price": number (in dollars, no commas, no $ sign),
+      "sale_type": "private sale/auction/off-the-plan/new build/unknown",
+      "agency": "agency name or empty string",
+      "source": "website where you found this data"
+    }
+  ],
+  "renovations": [
+    {
+      "year": number,
+      "description": "what was done",
+      "source": "where you found this"
+    }
+  ],
+  "notes": "any extra context — zoning, heritage, flood zone, etc.",
+  "data_confidence": "high/medium/low",
+  "sources_checked": ["list of URLs or sites you searched"]
+}
+
+CRITICAL RULES:
+- Search multiple times if needed to find complete history.
+- Include ALL sales you can find, sorted oldest to newest.
+- Prices must be plain numbers (e.g. 850000 not $850,000).
+- Dates must be YYYY-MM-DD. If only year known, use YYYY-01-01.
+- If a price was withheld, set price to null but still include the entry.
+- NEVER fabricate or hallucinate prices. Only report verified data.
+- If no data found, return the JSON with empty arrays.
+"""
+
+DA_SYSTEM_PROMPT = """You are a researcher looking up Development Applications
+(DAs), building permits and renovation approvals for a given Australian address.
+Use Google Search. Check council planning portals (NSW ePlanning, VicPlan,
+PlanSA, iPlan, etc.) and aggregators.
+
+Respond with ONLY valid JSON:
+{
+  "development_applications": [
+    {
+      "year": number,
+      "type": "renovation/extension/new build/demolition/other",
+      "description": "brief description",
+      "status": "approved/completed/pending/unknown",
+      "source": "URL or site"
+    }
+  ]
+}
+"""
+
+
+@st.cache_resource(show_spinner=False)
+def _get_gemini_client():
+    if not GENAI_AVAILABLE or not GEMINI_API_KEY:
+        return None
+    try:
+        return genai.Client(api_key=GEMINI_API_KEY)
+    except Exception:
+        return None
+
+
+@st.cache_resource(show_spinner=False)
+def _detect_gemini_model():
+    """Pick the first free-tier model that responds to a small test prompt."""
+    client = _get_gemini_client()
+    if client is None:
+        return None, "Gemini client not initialised (missing package or API key)."
+    last_err = "no models attempted"
+    for name in GEMINI_MODEL_PRIORITY:
+        try:
+            client.models.generate_content(
+                model=name,
+                contents="ok",
+                config=types.GenerateContentConfig(max_output_tokens=5),
+            )
+            return name, None
+        except Exception as e:
+            last_err = str(e)
+            continue
+    return None, last_err
+
+
+def _clean_json(text):
+    """Strip markdown fences and extract JSON from a Gemini response."""
+    if not text:
+        return None
+    text = re.sub(r"```json\s*", "", text)
+    text = re.sub(r"```\s*", "", text)
+    text = text.strip()
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def _query_gemini(prompt: str, system_instruction: str | None = None,
+                  retries: int = 3) -> str | None:
+    """Call Gemini with Google Search grounding + retry-on-rate-limit."""
+    client = _get_gemini_client()
+    model, _ = _detect_gemini_model()
+    if client is None or model is None:
+        return None
+
+    search_tool = types.Tool(google_search=types.GoogleSearch())
+    cfg = types.GenerateContentConfig(
+        tools=[search_tool],
+        temperature=0.1,
+        max_output_tokens=4096,
+    )
+    if system_instruction:
+        cfg.system_instruction = system_instruction
+
+    for attempt in range(retries):
+        try:
+            resp = client.models.generate_content(
+                model=model, contents=prompt, config=cfg
+            )
+            return resp.text
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                wait = min((2 ** (attempt + 1)) * 5, 45)
+                time.sleep(wait)
+                continue
+            if attempt < retries - 1:
+                time.sleep(2 ** (attempt + 1))
+                continue
+            return None
+    return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_property_history(address: str) -> dict | None:
+    """Research one property's sale history. Cached per address for 1 hour."""
+    prompt = (f"Find the complete sale and transaction history for this "
+              f"Australian property address: {address}\n\n"
+              "Search domain.com.au, realestate.com.au, onthehouse.com.au, "
+              "propertyvalue.com.au and any other relevant sites.")
+    raw = _query_gemini(prompt, system_instruction=HOME_PRICE_SYSTEM_PROMPT)
+    return _clean_json(raw)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_da_records(address: str) -> dict | None:
+    """Research DA / renovation records for the address."""
+    prompt = (f"Search for Development Applications, building permits, and "
+              f"renovation approvals for: {address}\n\n"
+              "Check council planning portals (NSW ePlanning, VicPlan, "
+              "PlanSA, iPlan, etc.) and aggregators.")
+    raw = _query_gemini(prompt, system_instruction=DA_SYSTEM_PROMPT)
+    return _clean_json(raw)
+
+
+def _parse_sale_date(d) -> datetime | None:
+    if not d:
+        return None
+    s = str(d)[:10]
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%d/%m/%Y", "%d-%m-%Y", "%Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _annualised_growth(p1: float, p2: float, years: float) -> float | None:
+    if not p1 or not p2 or years <= 0 or p1 <= 0:
+        return None
+    return ((p2 / p1) ** (1 / years) - 1) * 100
+
+
+def _detect_sale_flags(row: dict, reno_years: list[int] | None = None,
+                       median_growth: float = 5.5) -> str:
+    flags = []
+    gr = row.get("annual_growth_pct")
+    hold = row.get("hold_years")
+    stype = str(row.get("sale_type", "")).lower()
+    sale_year = row.get("year")
+
+    if reno_years and sale_year:
+        for ry in reno_years:
+            if ry <= sale_year and sale_year - ry <= 3:
+                flags.append("🔨 Post-reno sale")
+                break
+    if gr is not None and gr > median_growth * 2:
+        flags.append("📈 Abnormal growth")
+    if hold is not None and hold < 2 and gr is not None and gr > 15:
+        flags.append("⚡ Quick flip")
+    if any(kw in stype for kw in ["new", "built", "off the plan", "off-the-plan"]):
+        flags.append("🏗️ New build / OTP")
+    return " · ".join(flags)
+
+
+def _build_sales_dataframe(sales_ok: list[dict], reno_years: list[int]) -> pd.DataFrame:
+    rows = []
+    for i, s in enumerate(sales_ok):
+        dt = _parse_sale_date(s.get("date"))
+        row = {
+            "sale_num": i + 1,
+            "date": dt.strftime("%d %b %Y") if dt else (s.get("date") or "?"),
+            "date_obj": dt,
+            "year": dt.year if dt else None,
+            "price": s["price"],
+            "sale_type": s.get("sale_type") or "",
+            "agency": s.get("agency") or "",
+            "source": s.get("source") or "",
+            "hold_years": None,
+            "total_growth_pct": None,
+            "total_growth_dollar": None,
+            "annual_growth_pct": None,
+        }
+        if i > 0 and dt:
+            prev_dt = _parse_sale_date(sales_ok[i - 1].get("date"))
+            prev_price = sales_ok[i - 1]["price"]
+            if prev_dt and prev_price:
+                years = (dt - prev_dt).days / 365.25
+                row["hold_years"] = round(years, 1)
+                row["total_growth_pct"] = round((s["price"] / prev_price - 1) * 100, 1)
+                row["total_growth_dollar"] = round(s["price"] - prev_price)
+                if years > 0.1:
+                    ag = _annualised_growth(prev_price, s["price"], years)
+                    row["annual_growth_pct"] = round(ag, 1) if ag is not None else None
+        row["flags"] = _detect_sale_flags(row, reno_years=reno_years)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _render_property_result(address: str, data: dict, da_data: dict | None):
+    """Display full property analysis for a single address."""
+    # ---- Property summary card ----
+    matched = data.get("address") or address
+    col1, col2, col3 = st.columns([3, 1, 1])
+    col1.markdown(f"### 🏠 {matched}")
+    conf = (data.get("data_confidence") or "").lower()
+    if conf:
+        emoji = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(conf, "⚪")
+        col2.metric("Data confidence", f"{emoji} {conf.title()}")
+
+    feat_cols = st.columns(5)
+    def _feat(col, label, val):
+        col.metric(label, str(val) if val not in (None, "") else "—")
+    _feat(feat_cols[0], "Type", (data.get("property_type") or "?").title())
+    _feat(feat_cols[1], "Bed", data.get("bedrooms"))
+    _feat(feat_cols[2], "Bath", data.get("bathrooms"))
+    _feat(feat_cols[3], "Car", data.get("car_spaces"))
+    _feat(feat_cols[4], "Land (m²)", data.get("land_area_sqm"))
+    if data.get("year_built"):
+        st.caption(f"Built: {data['year_built']}")
+    if data.get("notes"):
+        st.info(data["notes"])
+
+    # ---- Sales ----
+    sales = data.get("sales") or []
+    sales_ok = [s for s in sales if s.get("price")]
+    sales_null = [s for s in sales if not s.get("price")]
+
+    if not sales_ok:
+        st.warning(
+            "No sale prices were found. The property may not have transacted recently, "
+            "the price may have been withheld, or the address might not match any listing. "
+            "Try searching the address directly on domain.com.au or realestate.com.au."
+        )
+        return
+
+    # DA years for flag detection
+    reno_years = []
+    if da_data and da_data.get("development_applications"):
+        for da in da_data["development_applications"]:
+            if da.get("year"):
+                try:
+                    reno_years.append(int(da["year"]))
+                except (TypeError, ValueError):
+                    pass
+
+    df = _build_sales_dataframe(sales_ok, reno_years)
+
+    # ---- Summary metrics ----
+    first_sale, last_sale = sales_ok[0], sales_ok[-1]
+    first_dt = _parse_sale_date(first_sale["date"])
+    last_dt = _parse_sale_date(last_sale["date"])
+    total_yrs = (last_dt - first_dt).days / 365.25 if first_dt and last_dt else 0
+    cagr = _annualised_growth(first_sale["price"], last_sale["price"], total_yrs) \
+        if total_yrs > 0.1 else None
+    total_ret_pct = (last_sale["price"] / first_sale["price"] - 1) * 100
+
+    st.markdown("### 📊 Summary")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Sales found", len(sales_ok))
+    m2.metric(
+        "First → Last",
+        f"${last_sale['price']:,.0f}",
+        delta=f"+${last_sale['price'] - first_sale['price']:,.0f}"
+        if last_sale['price'] >= first_sale['price'] else
+        f"-${first_sale['price'] - last_sale['price']:,.0f}",
+    )
+    m3.metric("Overall CAGR", f"{cagr:.1f}% p.a." if cagr is not None else "—")
+    m4.metric(
+        "Total return",
+        f"{total_ret_pct:+.1f}%",
+        delta=f"over {total_yrs:.1f} yrs" if total_yrs else None,
+        delta_color="off",
+    )
+
+    # ---- Chart ----
+    dates_x = [r["date_obj"] for _, r in df.iterrows() if r["date_obj"]]
+    prices_y = [r["price"] for _, r in df.iterrows() if r["date_obj"]]
+    flags_t = [r["flags"] for _, r in df.iterrows() if r["date_obj"]]
+    cagr_y = [r.get("annual_growth_pct") for _, r in df.iterrows() if r["date_obj"]]
+
+    if len(dates_x) >= 2:
+        st.markdown("### 📈 Price history")
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(go.Scatter(
+            x=dates_x, y=prices_y, mode="lines+markers", name="Sale price",
+            line=dict(color="#2563eb", width=3),
+            marker=dict(size=12, color="#2563eb", line=dict(width=2, color="white")),
+            hovertemplate="<b>%{x|%d %b %Y}</b><br>$%{y:,.0f}<extra></extra>",
+        ))
+        fdx = [d for d, f in zip(dates_x, flags_t) if f]
+        fdy = [p for p, f in zip(prices_y, flags_t) if f]
+        fdt = [f for f in flags_t if f]
+        if fdx:
+            fig.add_trace(go.Scatter(
+                x=fdx, y=fdy, mode="markers", name="Flagged",
+                marker=dict(size=18, color="#ef4444", symbol="diamond",
+                            line=dict(width=2, color="white")),
+                text=fdt,
+                hovertemplate="<b>%{x|%d %b %Y}</b><br>$%{y:,.0f}<br>%{text}<extra></extra>",
+            ))
+        for ry in reno_years:
+            fig.add_vline(x=datetime(ry, 6, 1), line_width=2,
+                          line_dash="dash", line_color="#f59e0b",
+                          annotation_text=f"🔨 DA {ry}",
+                          annotation_position="top")
+        bar_colors = ["#22c55e" if (g is not None and g >= 0) else "#ef4444"
+                      for g in cagr_y]
+        fig.add_trace(go.Bar(
+            x=dates_x, y=[g if g is not None else 0 for g in cagr_y],
+            name="CAGR %", marker_color=bar_colors, opacity=0.3,
+            hovertemplate="%{y:.1f}% p.a.<extra></extra>",
+        ), secondary_y=True)
+        fig.update_layout(
+            template="plotly_white", height=450,
+            legend=dict(orientation="h", y=-0.15),
+            hovermode="x unified",
+            margin=dict(t=30, b=30, l=10, r=10),
+        )
+        fig.update_yaxes(title_text="Sale price ($)", secondary_y=False,
+                         tickformat="$,.0f")
+        fig.update_yaxes(title_text="CAGR (%)", secondary_y=True,
+                         ticksuffix="%")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ---- Sale history table ----
+    st.markdown("### 📜 Sale history")
+    display_df = df.rename(columns={
+        "sale_num": "#", "date": "Date sold", "price": "Price",
+        "sale_type": "Type", "hold_years": "Hold (yrs)",
+        "total_growth_pct": "Total growth %", "annual_growth_pct": "CAGR %",
+        "flags": "Flags",
+    })[["#", "Date sold", "Price", "Type", "Hold (yrs)",
+        "Total growth %", "CAGR %", "Flags"]].copy()
+    display_df["Price"] = display_df["Price"].map(lambda v: f"${v:,.0f}")
+    display_df = display_df.fillna("—")
+    # replace any empty-string Flags with em-dash
+    display_df["Flags"] = display_df["Flags"].replace("", "—")
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    # ---- DA records ----
+    if da_data and da_data.get("development_applications"):
+        st.markdown("### 🏗️ Development applications / renovations")
+        da_rows = []
+        for da in da_data["development_applications"]:
+            da_rows.append({
+                "Year": da.get("year", "?"),
+                "Type": (da.get("type") or "?").title(),
+                "Description": da.get("description") or "",
+                "Status": (da.get("status") or "?").title(),
+                "Source": da.get("source") or "",
+            })
+        st.dataframe(pd.DataFrame(da_rows), use_container_width=True,
+                     hide_index=True)
+
+    # ---- Sources ----
+    srcs = data.get("sources_checked") or []
+    if srcs:
+        with st.expander(f"📚 Sources checked by Gemini ({len(srcs)})"):
+            for s in srcs:
+                st.caption(f"- {s}")
+    if sales_null:
+        st.caption(f"*{len(sales_null)} sale(s) had withheld prices and were "
+                   "excluded from growth calculations.*")
+
+
+def _render_home_price_tab():
+    """Body of the Home Price Growth tab."""
+    # ---- Setup guard ----
+    if not GENAI_AVAILABLE:
+        st.error(
+            "The `google-genai` package is not installed. Install it with:\n\n"
+            "```bash\npip install google-genai\n```\n\n"
+            "Then restart the app."
+        )
+        return
+
+    if not GEMINI_API_KEY:
+        st.warning("🔑 Add your Gemini API key to use this tab.")
+        with st.expander("How to set up (60 seconds, free)", expanded=True):
+            st.markdown(
+                "1. Go to **https://aistudio.google.com/apikey**\n"
+                "2. Click **Create API Key** (no credit card required)\n"
+                "3. Copy the key\n"
+                "4. Open this script file and paste it between the quotes on the line:\n"
+                "   ```python\n   GEMINI_API_KEY = \"\"\n   ```\n"
+                "5. Save the file — Streamlit will reload.\n\n"
+                "**Free-tier quotas (April 2026):**\n"
+                "- gemini-2.5-flash → 10 RPM · 250 RPD\n"
+                "- gemini-2.5-flash-lite → 15 RPM · 1000 RPD\n"
+                "- gemini-2.5-pro → 5 RPM · 100 RPD"
+            )
+        return
+
+    # Verify a model responds (cached).
+    model, err = _detect_gemini_model()
+    if model is None:
+        st.error(
+            f"Could not reach any Gemini model. Last error: {err or 'unknown'}\n\n"
+            "Possible causes:\n"
+            "- Invalid API key\n"
+            "- Daily quota exhausted (wait until midnight PT)\n"
+            "- All models in free tier currently limited — create a new Google\n"
+            "  Cloud project at aistudio.google.com for a fresh quota bucket."
+        )
+        if st.button("🔄 Retry connection", key="retry_gemini"):
+            _detect_gemini_model.clear()
+            _get_gemini_client.clear()
+            st.rerun()
+        return
+    st.success(f"✅ Connected · using **{model}** · results cached for 1h per address")
+
+    # ---- Input form ----
+    with st.form("home_price_form"):
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            address = st.text_input(
+                "Property address",
+                placeholder="e.g. 10 Smith Street, Fitzroy VIC 3065",
+                help="More specific = better results. Include suburb, state and postcode.",
+            )
+        with col2:
+            check_da = st.checkbox("Include DA/renovation records", value=True,
+                                    help="Uses an extra API call; slightly slower.")
+        submitted = st.form_submit_button("🔍 Analyse", type="primary",
+                                           use_container_width=True)
+
+    if submitted:
+        address = (address or "").strip()
+        if not address:
+            st.warning("Enter an address first.")
+            return
+        with st.status(f"Analysing {address}…", expanded=True) as status:
+            st.write("🔎 Searching sale history on domain, realestate, onthehouse…")
+            data = fetch_property_history(address)
+            if not data:
+                status.update(label="❌ Could not retrieve data",
+                              state="error", expanded=True)
+                st.error(
+                    "Gemini returned no parseable data for that address. "
+                    "Try a more specific format (include suburb, state and "
+                    "postcode). If the problem persists your daily quota may "
+                    "be exhausted."
+                )
+                return
+
+            da_data = None
+            if check_da:
+                st.write("🏗️ Searching DA / renovation records…")
+                time.sleep(1.5)  # gentle with the rate limit
+                da_data = fetch_da_records(address)
+
+            st.write("📊 Computing growth metrics…")
+            status.update(label="✅ Analysis complete", state="complete",
+                           expanded=False)
+
+        st.divider()
+        _render_property_result(address, data, da_data)
+
+    # ---- Compare mode ----
+    with st.expander("📊 Compare multiple properties (side by side)"):
+        st.caption(
+            "Paste up to 4 addresses, one per line. Each address uses 1-2 API "
+            "calls, so watch your quota."
+        )
+        multi = st.text_area(
+            "Addresses (one per line)",
+            placeholder="10 Smith Street, Fitzroy VIC 3065\n"
+                        "25 Hall Street, Bondi Beach NSW 2026",
+            height=120,
+        )
+        include_da_multi = st.checkbox("Include DA checks in comparison",
+                                       value=False, key="multi_da")
+        if st.button("Compare addresses", key="compare_btn"):
+            addrs = [a.strip() for a in (multi or "").split("\n") if a.strip()]
+            if not addrs:
+                st.warning("No addresses entered.")
+                return
+            if len(addrs) > 4:
+                st.warning("Limiting to the first 4 addresses.")
+                addrs = addrs[:4]
+            rows = []
+            for addr in addrs:
+                with st.spinner(f"Fetching {addr}…"):
+                    d = fetch_property_history(addr)
+                    dd = fetch_da_records(addr) if include_da_multi else None
+                if not d:
+                    rows.append(dict(Address=addr, Sales="—", First="—",
+                                     Last="—", CAGR="—", Flags="—"))
+                    continue
+                sales_ok = [s for s in (d.get("sales") or []) if s.get("price")]
+                if not sales_ok:
+                    rows.append(dict(Address=addr, Sales=0, First="—", Last="—",
+                                     CAGR="—", Flags="—"))
+                    continue
+                reno_years_local = []
+                if dd and dd.get("development_applications"):
+                    for da in dd["development_applications"]:
+                        if da.get("year"):
+                            try:
+                                reno_years_local.append(int(da["year"]))
+                            except (TypeError, ValueError):
+                                pass
+                df_a = _build_sales_dataframe(sales_ok, reno_years_local)
+                first = sales_ok[0]; last = sales_ok[-1]
+                fdt = _parse_sale_date(first["date"])
+                ldt = _parse_sale_date(last["date"])
+                yrs = (ldt - fdt).days / 365.25 if (fdt and ldt) else 0
+                cagr_a = _annualised_growth(first["price"], last["price"], yrs) \
+                    if yrs > 0.1 else None
+                flag_count = sum(1 for _, r in df_a.iterrows() if r.get("flags"))
+                rows.append(dict(
+                    Address=addr[:60],
+                    Sales=len(sales_ok),
+                    First=f"${first['price']:,.0f}",
+                    Last=f"${last['price']:,.0f}",
+                    CAGR=f"{cagr_a:.1f}%" if cagr_a is not None else "—",
+                    Flags=flag_count,
+                ))
+                time.sleep(1.5)
+            st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                         hide_index=True)
+
+    # ---- Helpful links ----
+    with st.expander("🏛️ Free council DA search portals"):
+        st.markdown(
+            "| State | Portal |\n"
+            "|---|---|\n"
+            "| NSW | [ePlanning DA Tracker](https://www.planningportal.nsw.gov.au/datracker) |\n"
+            "| VIC | [VicPlan](https://mapshare.vic.gov.au/vicplan/) |\n"
+            "| QLD | [MyDAS](https://planning.statedevelopment.qld.gov.au/) |\n"
+            "| SA  | [PlanSA](https://plan.sa.gov.au/) |\n"
+            "| WA  | [DPLH PlanWA](https://www.wa.gov.au/organisation/department-of-planning-lands-and-heritage) |\n"
+            "| TAS | [iPlan](https://iplan.tas.gov.au/) |\n"
+            "| ACT | [ACT Planning](https://www.planning.act.gov.au/) |\n"
+            "| NT  | [NT Planning](https://nt.gov.au/property/building-and-development) |\n"
+        )
+
+
+# =========================================================================
 # UI
 # =========================================================================
-st.title("🇦🇺 Retirement Simulation")
+st.title("🇦🇺 Retirement & Property Simulator")
 st.caption(
-    "Monthly cashflow simulation with Australian tax, super and Age Pension "
-    f"rules current to April {TODAY_YEAR}. Educational only; not financial advice."
+    "A two-tab tool. Tab 1 runs a monthly cashflow retirement simulation with "
+    f"Australian tax, super and Age Pension rules current to April {TODAY_YEAR}. "
+    "Tab 2 researches the sale history of any Australian property address using "
+    "Gemini + Google Search. Educational only; not financial advice."
 )
-with st.expander("What this simulator does and its limitations"):
-    st.markdown(
-        f"""
+
+tab1, tab2 = st.tabs(["🏦 Retirement Simulator", "🏠 Home Price Growth"])
+
+with tab1:
+    with st.expander("What this simulator does and its limitations"):
+        st.markdown(
+            f"""
 - Runs a **month-by-month** simulation from the start year to end year.
 - Each output is in **start-year dollars** (default **{TODAY_YEAR}** AUD), i.e.
   nominal values are deflated by CPI back to the start year so you can read
@@ -151,7 +793,7 @@ with st.expander("What this simulator does and its limitations"):
   withdrawing before age 60. The Age Pension is only claimed once ALL members
   are both retired and at/above pension age (conservative simplification).
 """
-    )
+        )
 
 # -------------------------------------------------------------------------
 # SIDEBAR INPUTS
@@ -808,169 +1450,184 @@ def run_sim():
 # =========================================================================
 # RUN & DISPLAY
 # =========================================================================
-if st.sidebar.button("▶ Run simulation", type="primary"):
-    with st.spinner("Running..."):
-        log, payoff_year = run_sim()
-        n_years = end_year - start_year
-        years = [start_year + i for i in range(n_years)]
+with tab1:
+    if st.sidebar.button("▶ Run simulation", type="primary"):
+        with st.spinner("Running..."):
+            log, payoff_year = run_sim()
+            n_years = end_year - start_year
+            years = [start_year + i for i in range(n_years)]
 
-        # Annual aggregation (flows = sum; balances = end-of-year)
-        flow_keys    = ["salary", "tax", "take_home", "sg", "sacrifice",
-                        "expenses_base", "expenses_kids", "expenses_mortgage",
-                        "expenses_total", "pension", "super_withdrawal",
-                        "outside_withdrawal", "savings_withdrawal",
-                        "savings_flow", "principal_paid", "shortfall"]
-        balance_keys = ["offset", "savings", "outside_balance",
-                        "super_m1", "super_m2", "super_total"]
+            # Annual aggregation (flows = sum; balances = end-of-year)
+            flow_keys    = ["salary", "tax", "take_home", "sg", "sacrifice",
+                            "expenses_base", "expenses_kids", "expenses_mortgage",
+                            "expenses_total", "pension", "super_withdrawal",
+                            "outside_withdrawal", "savings_withdrawal",
+                            "savings_flow", "principal_paid", "shortfall"]
+            balance_keys = ["offset", "savings", "outside_balance",
+                            "super_m1", "super_m2", "super_total"]
 
-        annual = {}
-        for k in flow_keys:
-            annual[k] = [sum(log[k][i*12:(i+1)*12]) for i in range(n_years)]
-        for k in balance_keys:
-            annual[k] = [log[k][(i+1)*12 - 1] for i in range(n_years)]
-        annual["retired_flag"] = [log["retired_flag"][(i+1)*12 - 1] for i in range(n_years)]
+            annual = {}
+            for k in flow_keys:
+                annual[k] = [sum(log[k][i*12:(i+1)*12]) for i in range(n_years)]
+            for k in balance_keys:
+                annual[k] = [log[k][(i+1)*12 - 1] for i in range(n_years)]
+            annual["retired_flag"] = [log["retired_flag"][(i+1)*12 - 1] for i in range(n_years)]
 
-        # ------------------- Summary -------------------
-        st.subheader("Summary")
-        first_retire_idx = next((i for i, r in enumerate(annual["retired_flag"]) if r), None)
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Mortgage paid off", f"{payoff_year}" if payoff_year else "Not paid off")
-        if first_retire_idx is not None:
-            pre_idx = max(first_retire_idx - 1, 0)
-            col2.metric(f"Super at retirement ({start_year} $)",
-                        f"${annual['super_total'][pre_idx]:,.0f}")
-            col3.metric(f"Investment at retirement ({start_year} $)",
-                        f"${annual['outside_balance'][pre_idx]:,.0f}")
-            col4.metric(f"Cash savings at retirement ({start_year} $)",
-                        f"${annual['savings'][pre_idx]:,.0f}")
+            # ------------------- Summary -------------------
+            st.subheader("Summary")
+            first_retire_idx = next((i for i, r in enumerate(annual["retired_flag"]) if r), None)
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Mortgage paid off", f"{payoff_year}" if payoff_year else "Not paid off")
+            if first_retire_idx is not None:
+                pre_idx = max(first_retire_idx - 1, 0)
+                col2.metric(f"Super at retirement ({start_year} $)",
+                            f"${annual['super_total'][pre_idx]:,.0f}")
+                col3.metric(f"Investment at retirement ({start_year} $)",
+                            f"${annual['outside_balance'][pre_idx]:,.0f}")
+                col4.metric(f"Cash savings at retirement ({start_year} $)",
+                            f"${annual['savings'][pre_idx]:,.0f}")
 
-        total_short = sum(annual["shortfall"])
-        if total_short > 0.5:
-            st.error(
-                f"Total unmet cashflow over simulation: "
-                f"${total_short:,.0f} ({start_year} dollars). "
-                "Some months, income + pension + super + outside were not enough to cover expenses."
-            )
-        else:
-            st.success("Plan funded: no shortfalls in any month.")
+            total_short = sum(annual["shortfall"])
+            if total_short > 0.5:
+                st.error(
+                    f"Total unmet cashflow over simulation: "
+                    f"${total_short:,.0f} ({start_year} dollars). "
+                    "Some months, income + pension + super + outside were not enough to cover expenses."
+                )
+            else:
+                st.success("Plan funded: no shortfalls in any month.")
 
-        # ------------------- Charts -------------------
-        st.subheader(f"Balances over time (in {start_year} dollars)")
-        fig1 = go.Figure()
-        fig1.add_trace(go.Scatter(x=years, y=annual["super_total"], name="Super (both)", mode="lines"))
-        fig1.add_trace(go.Scatter(x=years, y=annual["outside_balance"], name="Investment", mode="lines"))
-        fig1.add_trace(go.Scatter(x=years, y=annual["offset"], name="Offset (pre-payoff)", mode="lines",
-                                  line=dict(dash="dot")))
-        fig1.add_trace(go.Scatter(x=years, y=annual["savings"], name="Savings account (post-payoff)", mode="lines"))
-        fig1.update_layout(hovermode="x unified", yaxis_tickprefix="$", yaxis_tickformat=",",
-                           height=450, legend=dict(orientation="h", y=1.1))
-        st.plotly_chart(fig1, use_container_width=True)
+            # ------------------- Charts -------------------
+            st.subheader(f"Balances over time (in {start_year} dollars)")
+            fig1 = go.Figure()
+            fig1.add_trace(go.Scatter(x=years, y=annual["super_total"], name="Super (both)", mode="lines"))
+            fig1.add_trace(go.Scatter(x=years, y=annual["outside_balance"], name="Investment", mode="lines"))
+            fig1.add_trace(go.Scatter(x=years, y=annual["offset"], name="Offset (pre-payoff)", mode="lines",
+                                      line=dict(dash="dot")))
+            fig1.add_trace(go.Scatter(x=years, y=annual["savings"], name="Savings account (post-payoff)", mode="lines"))
+            fig1.update_layout(hovermode="x unified", yaxis_tickprefix="$", yaxis_tickformat=",",
+                               height=450, legend=dict(orientation="h", y=1.1))
+            st.plotly_chart(fig1, use_container_width=True)
 
-        st.subheader(f"Annual cashflow (in {start_year} dollars)")
-        fig2 = go.Figure()
-        fig2.add_trace(go.Bar(x=years, y=annual["take_home"], name="Take-home pay"))
-        fig2.add_trace(go.Bar(x=years, y=annual["pension"], name="Age Pension"))
-        fig2.add_trace(go.Bar(x=years, y=annual["super_withdrawal"], name="Super withdrawals"))
-        fig2.add_trace(go.Bar(x=years, y=annual["outside_withdrawal"], name="Outside withdrawals"))
-        fig2.add_trace(go.Scatter(x=years, y=annual["expenses_total"],
-                                  name="Total expenses", mode="lines+markers",
-                                  line=dict(color="black", width=2)))
-        fig2.update_layout(barmode="stack", hovermode="x unified",
-                           yaxis_tickprefix="$", yaxis_tickformat=",",
-                           height=450, legend=dict(orientation="h", y=1.15))
-        st.plotly_chart(fig2, use_container_width=True)
+            st.subheader(f"Annual cashflow (in {start_year} dollars)")
+            fig2 = go.Figure()
+            fig2.add_trace(go.Bar(x=years, y=annual["take_home"], name="Take-home pay"))
+            fig2.add_trace(go.Bar(x=years, y=annual["pension"], name="Age Pension"))
+            fig2.add_trace(go.Bar(x=years, y=annual["super_withdrawal"], name="Super withdrawals"))
+            fig2.add_trace(go.Bar(x=years, y=annual["outside_withdrawal"], name="Outside withdrawals"))
+            fig2.add_trace(go.Scatter(x=years, y=annual["expenses_total"],
+                                      name="Total expenses", mode="lines+markers",
+                                      line=dict(color="black", width=2)))
+            fig2.update_layout(barmode="stack", hovermode="x unified",
+                               yaxis_tickprefix="$", yaxis_tickformat=",",
+                               height=450, legend=dict(orientation="h", y=1.15))
+            st.plotly_chart(fig2, use_container_width=True)
 
-        if first_retire_idx is not None:
-            st.subheader(f"Retirement income mix (in {start_year} dollars)")
-            fig3 = go.Figure()
-            post = slice(first_retire_idx, None)
-            fig3.add_trace(go.Bar(x=years[post], y=annual["pension"][post], name="Age Pension"))
-            fig3.add_trace(go.Bar(x=years[post], y=annual["super_withdrawal"][post], name="Super drawdown"))
-            fig3.add_trace(go.Bar(x=years[post], y=annual["savings_withdrawal"][post], name="Savings drawdown"))
-            fig3.add_trace(go.Bar(x=years[post], y=annual["outside_withdrawal"][post], name="Investment drawdown"))
-            fig3.update_layout(barmode="stack", hovermode="x unified",
-                               yaxis_tickprefix="$", yaxis_tickformat=",", height=400)
-            st.plotly_chart(fig3, use_container_width=True)
+            if first_retire_idx is not None:
+                st.subheader(f"Retirement income mix (in {start_year} dollars)")
+                fig3 = go.Figure()
+                post = slice(first_retire_idx, None)
+                fig3.add_trace(go.Bar(x=years[post], y=annual["pension"][post], name="Age Pension"))
+                fig3.add_trace(go.Bar(x=years[post], y=annual["super_withdrawal"][post], name="Super drawdown"))
+                fig3.add_trace(go.Bar(x=years[post], y=annual["savings_withdrawal"][post], name="Savings drawdown"))
+                fig3.add_trace(go.Bar(x=years[post], y=annual["outside_withdrawal"][post], name="Investment drawdown"))
+                fig3.update_layout(barmode="stack", hovermode="x unified",
+                                   yaxis_tickprefix="$", yaxis_tickformat=",", height=400)
+                st.plotly_chart(fig3, use_container_width=True)
 
-        # ------------------- Tables -------------------
-        with st.expander(f"Year-by-year detail (in {start_year} dollars)"):
-            df = pd.DataFrame({
-                "Year": years,
-                "Retired?": ["Yes" if r else "" for r in annual["retired_flag"]],
-                "Salary (HH)": annual["salary"],
-                "Tax": annual["tax"],
-                "Take-home": annual["take_home"],
-                "SG contrib": annual["sg"],
-                "Salary sacrifice": annual["sacrifice"],
-                "Expenses base": annual["expenses_base"],
-                "Expenses kids": annual["expenses_kids"],
-                "Expenses mortgage": annual["expenses_mortgage"],
-                "Expenses total": annual["expenses_total"],
-                "Savings flow": annual["savings_flow"],
-                "Principal paid": annual["principal_paid"],
-                "Offset": annual["offset"],
-                "Savings account": annual["savings"],
-                "Investment": annual["outside_balance"],
-                "Super (M1)": annual["super_m1"],
-                "Super (M2)": annual["super_m2"],
-                "Super total": annual["super_total"],
-                "Pension": annual["pension"],
-                "Super withdraw": annual["super_withdrawal"],
-                "Savings withdraw": annual["savings_withdrawal"],
-                "Investment withdraw": annual["outside_withdrawal"],
-                "Shortfall": annual["shortfall"],
-            })
-            # Format money columns
-            money_cols = [c for c in df.columns if c not in ("Year", "Retired?")]
-            df_display = df.copy()
-            for c in money_cols:
-                df_display[c] = df_display[c].map(lambda v: f"${v:,.0f}")
-            st.dataframe(df_display, use_container_width=True, height=500)
-            csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download as CSV", csv, "retirement_sim.csv", "text/csv")
+            # ------------------- Tables -------------------
+            with st.expander(f"Year-by-year detail (in {start_year} dollars)"):
+                df = pd.DataFrame({
+                    "Year": years,
+                    "Retired?": ["Yes" if r else "" for r in annual["retired_flag"]],
+                    "Salary (HH)": annual["salary"],
+                    "Tax": annual["tax"],
+                    "Take-home": annual["take_home"],
+                    "SG contrib": annual["sg"],
+                    "Salary sacrifice": annual["sacrifice"],
+                    "Expenses base": annual["expenses_base"],
+                    "Expenses kids": annual["expenses_kids"],
+                    "Expenses mortgage": annual["expenses_mortgage"],
+                    "Expenses total": annual["expenses_total"],
+                    "Savings flow": annual["savings_flow"],
+                    "Principal paid": annual["principal_paid"],
+                    "Offset": annual["offset"],
+                    "Savings account": annual["savings"],
+                    "Investment": annual["outside_balance"],
+                    "Super (M1)": annual["super_m1"],
+                    "Super (M2)": annual["super_m2"],
+                    "Super total": annual["super_total"],
+                    "Pension": annual["pension"],
+                    "Super withdraw": annual["super_withdrawal"],
+                    "Savings withdraw": annual["savings_withdrawal"],
+                    "Investment withdraw": annual["outside_withdrawal"],
+                    "Shortfall": annual["shortfall"],
+                })
+                # Format money columns
+                money_cols = [c for c in df.columns if c not in ("Year", "Retired?")]
+                df_display = df.copy()
+                for c in money_cols:
+                    df_display[c] = df_display[c].map(lambda v: f"${v:,.0f}")
+                st.dataframe(df_display, use_container_width=True, height=500)
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button("Download as CSV", csv, "retirement_sim.csv", "text/csv")
 
-else:
-    st.info("Configure the sidebar, then click **Run simulation**.")
+    else:
+        st.info("Configure the sidebar, then click **Run simulation**.")
 
-# -------------------------------------------------------------------------
-# Footer: source list for defaults
-# -------------------------------------------------------------------------
-with st.expander("Sources for the default values"):
-    st.markdown(
-        """
-**Tax (FY 2025-26)** – ATO, *Tax rates – Australian resident*,
-https://www.ato.gov.au/tax-rates-and-codes/tax-rates-australian-residents
-(Stage 3 Tax Cuts, in effect since 1 July 2024, confirmed for FY 2025-26.)
+    # -------------------------------------------------------------------------
+    # Footer: source list for defaults
+    # -------------------------------------------------------------------------
+    with st.expander("Sources for the default values"):
+        st.markdown(
+            """
+    **Tax (FY 2025-26)** – ATO, *Tax rates – Australian resident*,
+    https://www.ato.gov.au/tax-rates-and-codes/tax-rates-australian-residents
+    (Stage 3 Tax Cuts, in effect since 1 July 2024, confirmed for FY 2025-26.)
 
-**Medicare levy + LITO** – ATO current year figures.
-LITO: $700 max, 5c/$ phase-out 37,500→45,000, 1.5c/$ 45,000→66,667.
+    **Medicare levy + LITO** – ATO current year figures.
+    LITO: $700 max, 5c/$ phase-out 37,500→45,000, 1.5c/$ 45,000→66,667.
 
-**Superannuation Guarantee** – 12% permanent from 1 July 2025.
-(Superannuation Guarantee (Administration) Act.)
+    **Superannuation Guarantee** – 12% permanent from 1 July 2025.
+    (Superannuation Guarantee (Administration) Act.)
 
-**Concessional cap** – $30,000 per person per year from 1 July 2024
-(ATO, Key superannuation rates and thresholds).
+    **Concessional cap** – $30,000 per person per year from 1 July 2024
+    (ATO, Key superannuation rates and thresholds).
 
-**Age Pension (rates from 20 March 2026)** – Services Australia:
-- Single: $1,200.90/fn = $31,223.40/yr (incl. pension & energy supplement)
-- Couple each: $905.20/fn, combined $1,810.40/fn = $47,070.40/yr
+    **Age Pension (rates from 20 March 2026)** – Services Australia:
+    - Single: $1,200.90/fn = $31,223.40/yr (incl. pension & energy supplement)
+    - Couple each: $905.20/fn, combined $1,810.40/fn = $47,070.40/yr
 
-**Income test (from 20 March 2026)** – free area $218/fn single,
-$380/fn couple combined; 50c/$ taper.
+    **Income test (from 20 March 2026)** – free area $218/fn single,
+    $380/fn couple combined; 50c/$ taper.
 
-**Assets test – full-pension thresholds (from 1 July 2025)**:
-- Single homeowner: $321,500;  couple homeowner: $481,500
-- Single non-homeowner: $579,500;  couple non-homeowner: $739,500
-Reduction $3/fn per $1,000 above threshold = $78/yr per $1,000.
+    **Assets test – full-pension thresholds (from 1 July 2025)**:
+    - Single homeowner: $321,500;  couple homeowner: $481,500
+    - Single non-homeowner: $579,500;  couple non-homeowner: $739,500
+    Reduction $3/fn per $1,000 above threshold = $78/yr per $1,000.
 
-**Deeming (from 20 March 2026)** – 1.25% up to $64,200 (single) / $106,200
-(couple); 3.25% above.
+    **Deeming (from 20 March 2026)** – 1.25% up to $64,200 (single) / $106,200
+    (couple); 3.25% above.
 
-**Minimum drawdown** – Superannuation Industry (Supervision) Regulations:
-4% (<65), 5% (65-74), 6% (75-79), 7% (80-84), 9% (85-89), 11% (90-94), 14% (95+).
+    **Minimum drawdown** – Superannuation Industry (Supervision) Regulations:
+    4% (<65), 5% (65-74), 6% (75-79), 7% (80-84), 9% (85-89), 11% (90-94), 14% (95+).
 
-**Retirement target (default)** – ASFA Retirement Standard, Sep 2025 quarter,
-homeowner 'comfortable': $77,375/yr couple, $54,240/yr single.
-https://www.superannuation.asn.au/consumers/retirement-standard/
-"""
+    **Retirement target (default)** – ASFA Retirement Standard, Sep 2025 quarter,
+    homeowner 'comfortable': $77,375/yr couple, $54,240/yr single.
+    https://www.superannuation.asn.au/consumers/retirement-standard/
+    """
+        )
+
+
+# =========================================================================
+# TAB 2 — HOME PRICE GROWTH
+# =========================================================================
+with tab2:
+    st.header("🏠 Australian Home Price Growth Analyser")
+    st.caption(
+        "Enter any Australian property address. This tab uses Google Gemini "
+        "(free tier) with Google Search grounding to research the sale history "
+        "from sites like domain.com.au, realestate.com.au, onthehouse.com.au "
+        "and more. Results are cached for 1 hour per address."
     )
+    _render_home_price_tab()
