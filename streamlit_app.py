@@ -1430,7 +1430,29 @@ def age_pension_monthly(
 # =========================================================================
 # SIMULATION
 # =========================================================================
-def run_sim():
+def run_sim(expense_overrides: dict | None = None):
+    """Run the full month-by-month simulation.
+
+    expense_overrides: optional dict {item_label: multiplier}. Multipliers
+    < 1 reduce that item, multipliers > 1 increase it. Item labels are the
+    keys of base_items (e.g. 'Groceries') or child_items (e.g. 'Childcare').
+    Used by the cost-optimisation tool. None = use the user-entered amounts.
+    """
+    expense_overrides = expense_overrides or {}
+
+    # Apply overrides to base items, recompute base_monthly
+    base_items_eff = {
+        name: amt * expense_overrides.get(name, 1.0)
+        for name, amt in base_items.items()
+    }
+    base_monthly_eff = sum(base_items_eff.values())
+
+    # Apply overrides to child items
+    child_items_eff = {
+        name: dict(cfg, amount=cfg["amount"] * expense_overrides.get(name, 1.0))
+        for name, cfg in child_items.items()
+    }
+
     months = (end_year - start_year) * 12
     r_mort_m = (1 + mortgage_rate) ** (1/12) - 1
 
@@ -1509,9 +1531,9 @@ def run_sim():
         # -----------------------------------------------------------------
         # Expenses — living + kids + mortgage (mortgage is always nominal fixed)
         # -----------------------------------------------------------------
-        base_today = base_monthly
+        base_today = base_monthly_eff
         kids_today = 0.0
-        for name, cfg in child_items.items():
+        for name, cfg in child_items_eff.items():
             if cfg["start"] <= year < cfg["end"]:
                 kids_today += cfg["amount"]
         expenses_living_nom = (base_today + kids_today) * infl_factor
@@ -1849,6 +1871,252 @@ with tab1:
                 st.dataframe(df_display, use_container_width=True, height=500)
                 csv = df.to_csv(index=False).encode("utf-8")
                 st.download_button("Download as CSV", csv, "retirement_sim.csv", "text/csv")
+
+            # ============================================================
+            # COST OPTIMISATION
+            # ============================================================
+            st.divider()
+            st.subheader("🎯 Cost Optimisation")
+            st.caption(
+                "For each adjustable expense, the simulator re-runs assuming "
+                "you reduced that expense by the % you choose, and measures "
+                "the lifetime financial improvement. Use this to find which "
+                "spending categories give you the most retirement benefit per "
+                "dollar saved."
+            )
+
+            opt_pct = st.slider(
+                "Hypothetical reduction to apply to each expense",
+                min_value=5, max_value=80, value=20, step=5,
+                format="%d%%",
+                help="A 20% reduction means the simulator pretends you cut "
+                     "that expense by 20% from now until end of simulation."
+            )
+
+            # Build candidate list: (label, monthly_amount_today, category, active_years)
+            # Active years = how many years this expense is actually paid.
+            n_sim_years = end_year - start_year
+            candidates = []
+            for label, amt in base_items.items():
+                if amt <= 0:
+                    continue
+                # Base items run for the full simulation
+                annual_amt_today = amt * 12
+                candidates.append({
+                    "label": label,
+                    "category": "Base",
+                    "monthly_today": amt,
+                    "annual_today": annual_amt_today,
+                    "active_years": n_sim_years,
+                })
+            for label, cfg in child_items.items():
+                if cfg["amount"] <= 0:
+                    continue
+                yrs_active = max(0, cfg["end"] - cfg["start"])
+                candidates.append({
+                    "label": label,
+                    "category": "Child",
+                    "monthly_today": cfg["amount"],
+                    "annual_today": cfg["amount"] * 12,
+                    "active_years": yrs_active,
+                })
+
+            if not candidates:
+                st.info("No adjustable expenses found to optimise.")
+            else:
+                # ----- Pareto chart: top expenses by lifetime cost -----
+                st.markdown("### 💸 Where your money actually goes (lifetime)")
+                # Lifetime cost in start-year dollars (no inflation discounting
+                # complication — we already deflate inside the sim, and these
+                # are user-entered today-$ values multiplied by years active).
+                for c in candidates:
+                    c["lifetime_cost"] = c["annual_today"] * c["active_years"]
+                # Sort and take top 15 for the chart
+                ranked_cost = sorted(candidates,
+                                     key=lambda c: c["lifetime_cost"],
+                                     reverse=True)[:15]
+                fig_cost = go.Figure()
+                fig_cost.add_trace(go.Bar(
+                    x=[c["lifetime_cost"] for c in ranked_cost],
+                    y=[f"{c['label']} ({c['category']})" for c in ranked_cost],
+                    orientation="h",
+                    marker_color=["#3b82f6" if c["category"] == "Base" else "#a855f7"
+                                  for c in ranked_cost],
+                    text=[f"${c['lifetime_cost']:,.0f}" for c in ranked_cost],
+                    textposition="outside",
+                    hovertemplate=(
+                        "<b>%{y}</b><br>"
+                        "Lifetime cost: $%{x:,.0f}<br>"
+                        "Years active: %{customdata[0]}<br>"
+                        "Annual: $%{customdata[1]:,.0f}<extra></extra>"
+                    ),
+                    customdata=[[c["active_years"], c["annual_today"]]
+                                for c in ranked_cost],
+                ))
+                fig_cost.update_layout(
+                    height=max(350, 30 * len(ranked_cost)),
+                    yaxis=dict(autorange="reversed"),
+                    xaxis_tickprefix="$", xaxis_tickformat=",",
+                    margin=dict(l=10, r=80, t=20, b=20),
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_cost, use_container_width=True)
+
+                # ----- Run sensitivity sweep -----
+                # For each candidate, run the sim with that expense scaled down.
+                multiplier = 1.0 - (opt_pct / 100.0)
+
+                # Establish baseline metrics from the ALREADY-COMPUTED log
+                baseline_shortfall_total = sum(annual["shortfall"])
+                baseline_final_super = annual["super_total"][-1]
+                baseline_final_invest = annual["outside_balance"][-1]
+                baseline_final_savings = annual["savings"][-1]
+                baseline_final_assets = (baseline_final_super
+                                         + baseline_final_invest
+                                         + baseline_final_savings)
+
+                # Lifetime improvement = (shortfall avoided) + (extra final assets)
+                progress = st.progress(0.0, text="Running sensitivity sweep…")
+                results = []
+                for idx, c in enumerate(candidates):
+                    progress.progress(
+                        (idx + 1) / len(candidates),
+                        text=f"Testing: {c['label']} ({idx+1}/{len(candidates)})…"
+                    )
+                    overrides = {c["label"]: multiplier}
+                    alt_log, _ = run_sim(expense_overrides=overrides)
+                    # Aggregate annual flows / end balances exactly as the main code does
+                    alt_short_annual = [sum(alt_log["shortfall"][i*12:(i+1)*12])
+                                        for i in range(n_sim_years)]
+                    alt_short_total = sum(alt_short_annual)
+                    alt_super = alt_log["super_total"][-1]
+                    alt_invest = alt_log["outside_balance"][-1]
+                    alt_savings = alt_log["savings"][-1]
+                    alt_final_assets = alt_super + alt_invest + alt_savings
+
+                    short_avoided = baseline_shortfall_total - alt_short_total
+                    extra_assets = alt_final_assets - baseline_final_assets
+                    lifetime_improvement = short_avoided + extra_assets
+
+                    # Total $ saved on this expense over the simulation,
+                    # expressed in start-year dollars (the user-entered
+                    # `annual_today` already IS in start-year dollars, and
+                    # `lifetime_improvement` is also in start-year dollars,
+                    # so this gives an apples-to-apples leverage ratio).
+                    dollars_saved = (c["annual_today"] * c["active_years"]
+                                     * (opt_pct / 100.0))
+                    leverage = (lifetime_improvement / dollars_saved
+                                if dollars_saved > 0 else 0)
+
+                    results.append({
+                        "label": c["label"],
+                        "category": c["category"],
+                        "monthly_today": c["monthly_today"],
+                        "annual_today": c["annual_today"],
+                        "active_years": c["active_years"],
+                        "dollars_saved": dollars_saved,
+                        "shortfall_avoided": short_avoided,
+                        "extra_final_assets": extra_assets,
+                        "lifetime_improvement": lifetime_improvement,
+                        "leverage": leverage,
+                    })
+                progress.empty()
+
+                # ----- Top 10 by lifetime improvement -----
+                results_sorted = sorted(results,
+                                        key=lambda r: r["lifetime_improvement"],
+                                        reverse=True)
+                top10 = results_sorted[:10]
+
+                st.markdown(f"### 🏆 Top 10 expenses to reduce (at {opt_pct}% cut)")
+                st.caption(
+                    "**Lifetime improvement** = (shortfall reduced) + "
+                    "(extra wealth at end of simulation), all in start-year dollars. "
+                    "**Leverage** = improvement per start-year dollar of expense reduced. "
+                    "Leverage <1× means inflation eats most of the saving (typical "
+                    "when surplus sits as cash). Leverage >1× means the surplus "
+                    "compounds (typical when routed into investment with real returns). "
+                    "Leverage near zero means the cut barely moves your retirement "
+                    "outcome — usually because some of the freed cashflow gets "
+                    "absorbed by higher tax or lost Age Pension entitlement."
+                )
+
+                fig_top = go.Figure()
+                fig_top.add_trace(go.Bar(
+                    x=[r["lifetime_improvement"] for r in reversed(top10)],
+                    y=[f"#{len(top10)-i}. {r['label']}" for i, r in enumerate(reversed(top10))],
+                    orientation="h",
+                    marker_color=[
+                        "#10b981" if r["lifetime_improvement"] > 0 else "#ef4444"
+                        for r in reversed(top10)
+                    ],
+                    text=[f"+${r['lifetime_improvement']:,.0f}"
+                          for r in reversed(top10)],
+                    textposition="outside",
+                    hovertemplate=(
+                        "<b>%{y}</b><br>"
+                        "Lifetime improvement: $%{x:,.0f}<br>"
+                        "Dollars saved: $%{customdata[0]:,.0f}<br>"
+                        "Leverage: %{customdata[1]:.2f}×<extra></extra>"
+                    ),
+                    customdata=[[r["dollars_saved"], r["leverage"]]
+                                for r in reversed(top10)],
+                ))
+                fig_top.update_layout(
+                    height=max(350, 35 * len(top10)),
+                    xaxis_tickprefix="$", xaxis_tickformat=",",
+                    xaxis_title=f"Lifetime improvement (start-year $) at {opt_pct}% cut",
+                    margin=dict(l=10, r=120, t=20, b=40),
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_top, use_container_width=True)
+
+                # ----- Detail table -----
+                st.markdown("### 📋 Full ranking")
+                df_opt = pd.DataFrame([{
+                    "Rank": i + 1,
+                    "Expense": r["label"],
+                    "Type": r["category"],
+                    "Today's monthly": f"${r['monthly_today']:,.0f}",
+                    "Active years": r["active_years"],
+                    f"$ saved at {opt_pct}%": f"${r['dollars_saved']:,.0f}",
+                    "Shortfall avoided": f"${r['shortfall_avoided']:,.0f}",
+                    "Extra final assets": f"${r['extra_final_assets']:,.0f}",
+                    "Lifetime improvement": f"${r['lifetime_improvement']:,.0f}",
+                    "Leverage": f"{r['leverage']:.2f}×",
+                } for i, r in enumerate(results_sorted)])
+                st.dataframe(df_opt, use_container_width=True, hide_index=True)
+
+                # ----- Combined-cut scenario -----
+                st.markdown(f"### 🧮 Combined: cut all top-10 by {opt_pct}%")
+                top10_overrides = {r["label"]: multiplier for r in top10}
+                combined_log, _ = run_sim(expense_overrides=top10_overrides)
+                comb_short = sum(combined_log["shortfall"])
+                comb_assets = (combined_log["super_total"][-1]
+                              + combined_log["outside_balance"][-1]
+                              + combined_log["savings"][-1])
+                comb_short_avoided = baseline_shortfall_total - comb_short
+                comb_extra = comb_assets - baseline_final_assets
+                comb_total = comb_short_avoided + comb_extra
+
+                cc1, cc2, cc3 = st.columns(3)
+                cc1.metric("Shortfall avoided",
+                           f"${comb_short_avoided:,.0f}",
+                           help="Reduction in cumulative unmet cashflow.")
+                cc2.metric("Extra final assets",
+                           f"${comb_extra:,.0f}",
+                           help="Increase in super + investment + savings at end.")
+                cc3.metric("Combined lifetime gain",
+                           f"${comb_total:,.0f}",
+                           delta=f"vs. baseline" if comb_total else None,
+                           delta_color="off")
+                st.caption(
+                    "Combined gain is usually a bit less than the sum of the "
+                    "10 individual gains — when you cut multiple expenses, "
+                    "the freed-up cashflow gets reinvested with diminishing "
+                    "marginal returns (e.g. once shortfall hits zero, further "
+                    "cuts only boost final assets, not pension entitlement)."
+                )
 
     else:
         st.info("Configure the sidebar, then click **Run simulation**.")
