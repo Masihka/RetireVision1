@@ -4,7 +4,8 @@ Australian Retirement Simulation + Home Price Growth Analyser.
 Two tabs in one app:
   1. Retirement Simulator — monthly cashflow sim with AU tax, super and
      Age Pension rules verified as of April 2026 (FY 2025-26).
-  2. Home Price Growth — address-based intelligent property sale history research.
+  2. Home Price Growth — address-based property sale history research via
+     Google Gemini + Google Search grounding.
 
 Run with:   streamlit run retirement_sim.py
 
@@ -38,13 +39,13 @@ except ImportError:
     GENAI_AVAILABLE = False
 
 # =========================================================================
-# 🔑  GOOGLE GEMINI API KEY
+# 🔑  GOOGLE GEMINI API KEY (optional default)
 # =========================================================================
-# Get a free key at:  https://aistudio.google.com/apikey
-# Paste it between the quotes on the line below and save the file.
-# Leave it empty to hide the Home Price tab's functionality (the tab will
-# show setup instructions instead).
-GEMINI_API_KEY = "AIzaSyBhJAPk2Z-jRkcTYmu8Un9kwBsv8OylT9o"
+# Users enter their key in the sidebar of the app at runtime, so this is
+# usually left blank. If you want to embed a default key (e.g. for a private
+# deployment), paste it between the quotes below — it'll pre-fill the input.
+# Get a free key at: https://aistudio.google.com/apikey
+GEMINI_API_KEY_DEFAULT = ""
 # =========================================================================
 
 # -------------------------------------------------------------------------
@@ -221,22 +222,52 @@ Respond with ONLY valid JSON:
 """
 
 
-@st.cache_resource(show_spinner=False)
+def _current_api_key() -> str:
+    """Return the API key for this user session.
+    Priority: sidebar input (in session_state) → file-level default → empty."""
+    return (st.session_state.get("gemini_api_key", "") or "").strip() \
+        or GEMINI_API_KEY_DEFAULT.strip()
+
+
 def _get_gemini_client():
-    if not GENAI_AVAILABLE or not GEMINI_API_KEY:
+    """Build a Gemini client for the current session's key. Returns None if
+    no key is set or the client init fails."""
+    if not GENAI_AVAILABLE:
         return None
+    key = _current_api_key()
+    if not key:
+        return None
+    # Cache the client on the session so we don't rebuild per call, but DO
+    # rebuild if the user changes their key.
+    cached = st.session_state.get("_gemini_client")
+    cached_key = st.session_state.get("_gemini_client_key")
+    if cached is not None and cached_key == key:
+        return cached
     try:
-        return genai.Client(api_key=GEMINI_API_KEY)
+        client = genai.Client(api_key=key)
     except Exception:
+        st.session_state["_gemini_client"] = None
+        st.session_state["_gemini_client_key"] = key
         return None
+    st.session_state["_gemini_client"] = client
+    st.session_state["_gemini_client_key"] = key
+    return client
 
 
-@st.cache_resource(show_spinner=False)
 def _detect_gemini_model():
-    """Pick the first free-tier model that responds to a small test prompt."""
+    """Pick the first free-tier model that responds to a small test prompt.
+    Cached on the session keyed by the API key, so changing keys forces a
+    re-detection."""
     client = _get_gemini_client()
     if client is None:
         return None, "Gemini client not initialised (missing package or API key)."
+
+    key = _current_api_key()
+    cached = st.session_state.get("_gemini_model")
+    cached_for_key = st.session_state.get("_gemini_model_key")
+    if cached and cached_for_key == key:
+        return cached, None
+
     last_err = "no models attempted"
     for name in GEMINI_MODEL_PRIORITY:
         try:
@@ -245,10 +276,14 @@ def _detect_gemini_model():
                 contents="ok",
                 config=types.GenerateContentConfig(max_output_tokens=5),
             )
+            st.session_state["_gemini_model"] = name
+            st.session_state["_gemini_model_key"] = key
             return name, None
         except Exception as e:
             last_err = str(e)
             continue
+    st.session_state["_gemini_model"] = None
+    st.session_state["_gemini_model_key"] = key
     return None, last_err
 
 
@@ -313,8 +348,11 @@ def _query_gemini(prompt: str, system_instruction: str | None = None,
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_property_history(address: str) -> dict | None:
-    """Research one property's sale history. Cached per address for 1 hour."""
+def _fetch_property_history_cached(address: str, _api_key_fingerprint: str) -> dict | None:
+    """Internal cached fetch. The api_key fingerprint is part of the cache
+    key so different users don't see each other's cached results — but it
+    is not actually used inside the function body (the live key comes from
+    session state via _query_gemini)."""
     prompt = (f"Find the complete sale and transaction history for this "
               f"Australian property address: {address}\n\n"
               "Search domain.com.au, realestate.com.au, onthehouse.com.au, "
@@ -323,15 +361,33 @@ def fetch_property_history(address: str) -> dict | None:
     return _clean_json(raw)
 
 
+def fetch_property_history(address: str) -> dict | None:
+    return _fetch_property_history_cached(address, _api_key_fingerprint())
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_da_records(address: str) -> dict | None:
-    """Research DA / renovation records for the address."""
+def _fetch_da_records_cached(address: str, _api_key_fingerprint: str) -> dict | None:
     prompt = (f"Search for Development Applications, building permits, and "
               f"renovation approvals for: {address}\n\n"
               "Check council planning portals (NSW ePlanning, VicPlan, "
               "PlanSA, iPlan, etc.) and aggregators.")
     raw = _query_gemini(prompt, system_instruction=DA_SYSTEM_PROMPT)
     return _clean_json(raw)
+
+
+def fetch_da_records(address: str) -> dict | None:
+    return _fetch_da_records_cached(address, _api_key_fingerprint())
+
+
+def _api_key_fingerprint() -> str:
+    """Short fingerprint of the current API key — used only as a cache-key
+    discriminator so caches don't leak between users in shared deployments.
+    The actual key is never logged, returned, or sent anywhere."""
+    import hashlib
+    key = _current_api_key()
+    if not key:
+        return "no-key"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
 
 
 # -------------------------------------------------------------------------
@@ -738,7 +794,7 @@ def _render_property_result(address: str, data: dict, da_data: dict | None):
     # ---- Sources ----
     srcs = data.get("sources_checked") or []
     if srcs:
-        with st.expander(f"📚 Sources checked ({len(srcs)})"):
+        with st.expander(f"📚 Sources checked by Gemini ({len(srcs)})"):
             for s in srcs:
                 st.caption(f"- {s}")
     if sales_null:
@@ -757,21 +813,44 @@ def _render_home_price_tab():
         )
         return
 
-    if not GEMINI_API_KEY:
-        st.warning("🔑 Add your Gemini API key to use this tab.")
-        with st.expander("How to set up (60 seconds, free)", expanded=True):
-            st.markdown(
-                "1. Go to **https://aistudio.google.com/apikey**\n"
-                "2. Click **Create API Key** (no credit card required)\n"
-                "3. Copy the key\n"
-                "4. Open this script file and paste it between the quotes on the line:\n"
-                "   ```python\n   GEMINI_API_KEY = \"\"\n   ```\n"
-                "5. Save the file — Streamlit will reload.\n\n"
-                "**Free-tier quotas (April 2026):**\n"
-                "- gemini-2.5-flash → 10 RPM · 250 RPD\n"
-                "- gemini-2.5-flash-lite → 15 RPM · 1000 RPD\n"
-                "- gemini-2.5-pro → 5 RPM · 100 RPD"
+    # ---- API key input (top of the tab) ----
+    with st.container(border=True):
+        col_key, col_help = st.columns([3, 1])
+        with col_key:
+            entered = st.text_input(
+                "🔑 Google Gemini API key",
+                value=st.session_state.get("gemini_api_key", GEMINI_API_KEY_DEFAULT),
+                type="password",
+                placeholder="Paste your free key from aistudio.google.com/apikey",
+                help=(
+                    "Your key is held only in this browser session. It's never "
+                    "logged or sent anywhere except to Google's API to run "
+                    "your queries. Get one free at https://aistudio.google.com/apikey"
+                ),
+                key="gemini_api_key_input",
             )
+            # Persist into the canonical session_state slot
+            if entered != st.session_state.get("gemini_api_key", ""):
+                st.session_state["gemini_api_key"] = entered
+                # Force model re-detection on key change
+                for k in ("_gemini_client", "_gemini_client_key",
+                          "_gemini_model", "_gemini_model_key"):
+                    st.session_state.pop(k, None)
+        with col_help:
+            with st.popover("ℹ️ How to get a key", use_container_width=True):
+                st.markdown(
+                    "1. Open **https://aistudio.google.com/apikey** in a new tab\n"
+                    "2. Click **Create API Key** (no credit card needed)\n"
+                    "3. Copy and paste it on the left\n\n"
+                    "**Free-tier quotas (April 2026):**\n"
+                    "- gemini-2.5-flash → 10 RPM · 250 RPD\n"
+                    "- gemini-2.5-flash-lite → 15 RPM · 1000 RPD\n"
+                    "- gemini-2.5-pro → 5 RPM · 100 RPD\n\n"
+                    "RPM = requests per minute, RPD = requests per day."
+                )
+
+    if not _current_api_key():
+        st.info("Enter your Gemini API key above to start analysing properties.")
         return
 
     # Verify a model responds (cached).
@@ -786,8 +865,9 @@ def _render_home_price_tab():
             "  Cloud project at aistudio.google.com for a fresh quota bucket."
         )
         if st.button("🔄 Retry connection", key="retry_gemini"):
-            _detect_gemini_model.clear()
-            _get_gemini_client.clear()
+            for k in ("_gemini_client", "_gemini_client_key",
+                      "_gemini_model", "_gemini_model_key"):
+                st.session_state.pop(k, None)
             st.rerun()
         return
     st.success(f"✅ Connected · using **{model}** · results cached for 1h per address")
@@ -949,8 +1029,8 @@ st.title("🇦🇺 Retirement & Property Simulator")
 st.caption(
     "A two-tab tool. Tab 1 runs a monthly cashflow retirement simulation with "
     f"Australian tax, super and Age Pension rules current to April {TODAY_YEAR}. "
-    "Tab 2 researches the sale history of any Australian property address."
-    " Educational only; not financial advice."
+    "Tab 2 researches the sale history of any Australian property address using "
+    "Gemini + Google Search. Educational only; not financial advice."
 )
 
 tab1, tab2 = st.tabs(["🏦 Retirement Simulator", "🏠 Home Price Growth"])
@@ -1823,7 +1903,8 @@ with tab1:
 with tab2:
     st.header("🏠 Australian Home Price Growth Analyser")
     st.caption(
-        "Enter any Australian property address. This tab researches the sale history "
+        "Enter any Australian property address. This tab uses Google Gemini "
+        "(free tier) with Google Search grounding to research the sale history "
         "from sites like domain.com.au, realestate.com.au, onthehouse.com.au "
         "and more. Results are cached for 1 hour per address."
     )
