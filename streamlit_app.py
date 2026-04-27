@@ -288,22 +288,156 @@ def _detect_gemini_model():
 
 
 def _clean_json(text):
-    """Strip markdown fences and extract JSON from a Gemini response."""
+    """Extract JSON from a Gemini response. Robust to:
+    - markdown ```json fences
+    - leading prose ("Here are the listings I found:")
+    - trailing prose / citations after the JSON
+    - JSON that got truncated mid-array (salvages by trimming back)
+    - single-quoted strings (last-resort: try ast.literal_eval)
+    Returns parsed dict/list, or None if nothing salvageable.
+    """
     if not text:
         return None
-    text = re.sub(r"```json\s*", "", text)
-    text = re.sub(r"```\s*", "", text)
-    text = text.strip()
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
+
+    # 1) Strip markdown fences
+    cleaned = re.sub(r"```json\s*", "", text)
+    cleaned = re.sub(r"```\s*", "", cleaned)
+    cleaned = cleaned.strip()
+
+    # 2) Try direct parse
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # 3) Find the FIRST balanced JSON object/array using a bracket counter.
+    # This handles trailing prose better than the greedy regex.
+    def _balanced_extract(s, open_c, close_c):
+        depth = 0
+        start = -1
+        in_str = False
+        esc = False
+        for i, ch in enumerate(s):
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == open_c:
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == close_c:
+                depth -= 1
+                if depth == 0 and start != -1:
+                    return s[start:i + 1]
+        # Not balanced — return from start to end (likely truncated)
+        if start != -1:
+            return s[start:]
+        return None
+
+    for open_c, close_c in (("{", "}"), ("[", "]")):
+        candidate = _balanced_extract(cleaned, open_c, close_c)
+        if not candidate:
+            continue
         try:
-            return json.loads(match.group())
+            return json.loads(candidate)
         except json.JSONDecodeError:
             pass
+
+        # Truncation recovery: walk backward to the last complete element
+        # and append the missing closing brackets/braces. We track the
+        # bracket stack as we scan to know what closers are needed.
+        def _try_close(s):
+            stack = []
+            in_str = False
+            esc = False
+            last_complete = -1
+            for i, ch in enumerate(s):
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                    continue
+                if ch == '"':
+                    in_str = True
+                elif ch in "{[":
+                    stack.append("}" if ch == "{" else "]")
+                elif ch in "}]":
+                    if stack and stack[-1] == ch:
+                        stack.pop()
+                        if not stack:
+                            last_complete = i
+                elif ch == "," and not stack:
+                    pass
+                elif ch == "," and stack:
+                    last_complete = i
+            # Strategy A: trim back to last comma at the right depth, then
+            # close all open structures.
+            for j in range(len(s) - 1, max(last_complete, -1), -1):
+                if s[j] == ",":
+                    trimmed = s[:j]
+                    # Recount stack for the trimmed string
+                    sub_stack = []
+                    sub_in_str = False
+                    sub_esc = False
+                    for ch in trimmed:
+                        if sub_in_str:
+                            if sub_esc:
+                                sub_esc = False
+                            elif ch == "\\":
+                                sub_esc = True
+                            elif ch == '"':
+                                sub_in_str = False
+                            continue
+                        if ch == '"':
+                            sub_in_str = True
+                        elif ch in "{[":
+                            sub_stack.append("}" if ch == "{" else "]")
+                        elif ch in "}]" and sub_stack and sub_stack[-1] == ch:
+                            sub_stack.pop()
+                    if not sub_in_str:
+                        candidate_s = trimmed + "".join(reversed(sub_stack))
+                        try:
+                            return json.loads(candidate_s)
+                        except json.JSONDecodeError:
+                            continue
+            # Strategy B: just close the open structures from current state
+            if not in_str and stack:
+                try:
+                    return json.loads(s + "".join(reversed(stack)))
+                except json.JSONDecodeError:
+                    pass
+            return None
+
+        recovered = _try_close(candidate)
+        if recovered is not None:
+            return recovered
+
+        # Repair trailing commas
+        repaired = re.sub(r",(\s*[}\]])", r"\1", candidate)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            pass
+
+    # 4) Last resort: ast.literal_eval (handles single-quoted dicts)
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return None
+        import ast
+        return ast.literal_eval(cleaned)
+    except (ValueError, SyntaxError):
+        pass
+
+    return None
 
 
 def _query_gemini(prompt: str, system_instruction: str | None = None,
@@ -333,7 +467,14 @@ def _query_gemini(prompt: str, system_instruction: str | None = None,
             resp = client.models.generate_content(
                 model=model, contents=prompt, config=cfg
             )
-            return resp.text
+            text = resp.text
+            # Stash for debugging if parsing later fails. Keep only the most
+            # recent response, capped to a few KB so it doesn't bloat session.
+            try:
+                st.session_state["_last_gemini_raw"] = (text or "")[:20000]
+            except Exception:
+                pass
+            return text
         except Exception as e:
             err = str(e)
             if "429" in err or "RESOURCE_EXHAUSTED" in err:
@@ -450,7 +591,7 @@ def _fetch_listings_cached(suburb: str, price_min: int, price_max: int,
     """Find for-sale listings. 15-min cache (listings change quickly)."""
     type_filter = f", property type {prop_type}" if prop_type and prop_type != "Any" else ""
     beds_filter = f", at least {beds_min} bedrooms" if beds_min and beds_min > 0 else ""
-    prompt = (
+    base_prompt = (
         f"Find current FOR-SALE residential listings in {suburb}, Australia, "
         f"with asking price between ${price_min:,} and ${price_max:,}"
         f"{type_filter}{beds_filter}.\n\n"
@@ -459,9 +600,30 @@ def _fetch_listings_cached(suburb: str, price_min: int, price_max: int,
         "and rental listings. Provide the full address so the buyer can "
         "research the property's history."
     )
-    raw = _query_gemini(prompt, system_instruction=LISTINGS_SYSTEM_PROMPT,
-                       max_output_tokens=8192)
-    return _clean_json(raw)
+    raw = _query_gemini(base_prompt, system_instruction=LISTINGS_SYSTEM_PROMPT,
+                       max_output_tokens=16384)
+    parsed = _clean_json(raw)
+    if parsed is not None:
+        return parsed
+
+    # Retry: stricter JSON-only instruction, no preamble allowed.
+    strict_prompt = (
+        base_prompt + "\n\nIMPORTANT: Your entire reply must be a single valid "
+        "JSON object exactly matching the schema. Do not write any preamble, "
+        "explanation, markdown fences, or trailing commentary. Begin your "
+        "reply with { and end with }. Limit to 8 listings if needed to fit "
+        "the response within the token budget."
+    )
+    raw2 = _query_gemini(strict_prompt, system_instruction=LISTINGS_SYSTEM_PROMPT,
+                        max_output_tokens=16384)
+    parsed2 = _clean_json(raw2)
+    if parsed2 is not None:
+        return parsed2
+
+    # Both attempts failed. Return a sentinel that the renderer can use to
+    # show the raw response for debugging.
+    return {"_parse_failed": True,
+            "_raw_attempts": [raw or "(no response)", raw2 or "(no response)"]}
 
 
 def fetch_listings(suburb: str, price_min: int, price_max: int,
@@ -1186,14 +1348,27 @@ def _render_listings_search_tab():
             st.write("🔎 Querying domain, realestate, allhomes…")
             data = fetch_listings(suburb, int(price_min), int(price_max),
                                   int(beds_min), prop_type)
-            if data is None:
+            if data is None or data.get("_parse_failed"):
                 status.update(label="❌ Search failed", state="error",
                               expanded=True)
                 st.error(
-                    "Gemini didn't return parseable listings. Try a more "
-                    "specific suburb format (with state + postcode) or "
-                    "adjust the price range."
+                    "Gemini returned a response but it couldn't be parsed as "
+                    "JSON listings. This usually means one of:\n"
+                    "- Gemini wrote a long preamble before the JSON and ran "
+                    "out of tokens before completing the listings\n"
+                    "- The model returned prose instead of JSON\n"
+                    "- The suburb genuinely has no listings in this range "
+                    "(but Gemini phrased that as text rather than `[]`)\n\n"
+                    "**Try:** narrowing the price range; including state + "
+                    "postcode in the suburb; or trying again in a minute "
+                    "(model behaviour varies)."
                 )
+                # Show the raw responses so we can see what actually came back
+                if data and data.get("_raw_attempts"):
+                    with st.expander("🔍 Show raw Gemini response (for debugging)"):
+                        for i, attempt in enumerate(data["_raw_attempts"], 1):
+                            st.markdown(f"**Attempt {i}:**")
+                            st.code((attempt or "")[:5000], language="text")
                 return
             status.update(label="✅ Search complete", state="complete",
                           expanded=False)
