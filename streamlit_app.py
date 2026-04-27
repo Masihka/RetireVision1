@@ -443,14 +443,30 @@ def _clean_json(text):
 def _query_gemini(prompt: str, system_instruction: str | None = None,
                   retries: int = 3, model_override: str | None = None,
                   max_output_tokens: int = 4096) -> str | None:
-    """Call Gemini with Google Search grounding + retry-on-rate-limit."""
+    """Call Gemini with Google Search grounding + retry-on-rate-limit.
+
+    On failure, stashes the last error in st.session_state['_last_gemini_error']
+    so callers can show it in diagnostic UI. Returns the response text on
+    success, or None on persistent failure (after all retries)."""
     client = _get_gemini_client()
     if client is None:
+        try:
+            st.session_state["_last_gemini_error"] = (
+                "No Gemini client (missing API key or package)."
+            )
+        except Exception:
+            pass
         return None
     model = model_override
     if model is None:
-        model, _ = _detect_gemini_model()
+        model, det_err = _detect_gemini_model()
         if model is None:
+            try:
+                st.session_state["_last_gemini_error"] = (
+                    f"No Gemini model available. Detection error: {det_err}"
+                )
+            except Exception:
+                pass
             return None
 
     search_tool = types.Tool(google_search=types.GoogleSearch())
@@ -462,29 +478,72 @@ def _query_gemini(prompt: str, system_instruction: str | None = None,
     if system_instruction:
         cfg.system_instruction = system_instruction
 
+    last_error = None
     for attempt in range(retries):
         try:
             resp = client.models.generate_content(
                 model=model, contents=prompt, config=cfg
             )
-            text = resp.text
-            # Stash for debugging if parsing later fails. Keep only the most
-            # recent response, capped to a few KB so it doesn't bloat session.
+            text = resp.text if resp is not None else None
+
+            # Check for empty / blocked response
+            if text is None or text.strip() == "":
+                # Try to extract a reason from the response object
+                reason_parts = ["Gemini returned an empty response"]
+                try:
+                    if resp is not None and hasattr(resp, "candidates") and resp.candidates:
+                        cand = resp.candidates[0]
+                        finish = getattr(cand, "finish_reason", None)
+                        if finish:
+                            reason_parts.append(f"finish_reason={finish}")
+                        safety = getattr(cand, "safety_ratings", None)
+                        if safety:
+                            reason_parts.append(f"safety={safety}")
+                    if resp is not None and hasattr(resp, "prompt_feedback"):
+                        pf = resp.prompt_feedback
+                        if pf:
+                            reason_parts.append(f"prompt_feedback={pf}")
+                except Exception:
+                    pass
+                last_error = " · ".join(reason_parts)
+                # Don't retry on empty responses — they're usually deterministic
+                # (e.g. safety block, content filter)
+                try:
+                    st.session_state["_last_gemini_error"] = last_error
+                    st.session_state["_last_gemini_raw"] = ""
+                except Exception:
+                    pass
+                return None
+
+            # Success
             try:
-                st.session_state["_last_gemini_raw"] = (text or "")[:20000]
+                st.session_state["_last_gemini_raw"] = text[:20000]
+                st.session_state["_last_gemini_error"] = None
             except Exception:
                 pass
             return text
         except Exception as e:
             err = str(e)
-            if "429" in err or "RESOURCE_EXHAUSTED" in err:
+            last_error = f"{type(e).__name__}: {err[:300]}"
+            if "429" in err or "RESOURCE_EXHAUSTED" in err or "quota" in err.lower():
                 wait = min((2 ** (attempt + 1)) * 5, 45)
                 time.sleep(wait)
                 continue
             if attempt < retries - 1:
                 time.sleep(2 ** (attempt + 1))
                 continue
+            try:
+                st.session_state["_last_gemini_error"] = last_error
+            except Exception:
+                pass
             return None
+    # Exhausted retries
+    try:
+        st.session_state["_last_gemini_error"] = (
+            last_error or "All retries exhausted (likely rate-limited)."
+        )
+    except Exception:
+        pass
     return None
 
 
@@ -602,6 +661,7 @@ def _fetch_listings_cached(suburb: str, price_min: int, price_max: int,
     )
     raw = _query_gemini(base_prompt, system_instruction=LISTINGS_SYSTEM_PROMPT,
                        max_output_tokens=16384)
+    err1 = st.session_state.get("_last_gemini_error", "") if raw is None else ""
     parsed = _clean_json(raw)
     if parsed is not None:
         return parsed
@@ -616,21 +676,37 @@ def _fetch_listings_cached(suburb: str, price_min: int, price_max: int,
     )
     raw2 = _query_gemini(strict_prompt, system_instruction=LISTINGS_SYSTEM_PROMPT,
                         max_output_tokens=16384)
+    err2 = st.session_state.get("_last_gemini_error", "") if raw2 is None else ""
     parsed2 = _clean_json(raw2)
     if parsed2 is not None:
         return parsed2
 
-    # Both attempts failed. Return a sentinel that the renderer can use to
-    # show the raw response for debugging.
+    # Both attempts failed. Combine the per-attempt errors and surface them.
+    combined_err = " | ".join(filter(None, [
+        f"attempt 1: {err1}" if err1 else "",
+        f"attempt 2: {err2}" if err2 else "",
+    ])) or "Both attempts returned no parseable text."
+    try:
+        st.session_state["_last_gemini_error"] = combined_err
+    except Exception:
+        pass
     return {"_parse_failed": True,
             "_raw_attempts": [raw or "(no response)", raw2 or "(no response)"]}
 
 
 def fetch_listings(suburb: str, price_min: int, price_max: int,
                    beds_min: int, prop_type: str) -> dict | None:
-    return _fetch_listings_cached(suburb, price_min, price_max,
-                                  beds_min, prop_type,
-                                  _api_key_fingerprint())
+    result = _fetch_listings_cached(suburb, price_min, price_max,
+                                    beds_min, prop_type,
+                                    _api_key_fingerprint())
+    # If the cached result was a failure, evict it so the user can retry
+    # without waiting 15 minutes for the TTL to expire.
+    if result is None or (isinstance(result, dict) and result.get("_parse_failed")):
+        try:
+            _fetch_listings_cached.clear()
+        except Exception:
+            pass
+    return result
 
 
 # -------------------------------------------------------------------------
@@ -1351,24 +1427,28 @@ def _render_listings_search_tab():
             if data is None or data.get("_parse_failed"):
                 status.update(label="❌ Search failed", state="error",
                               expanded=True)
+                gemini_err = st.session_state.get("_last_gemini_error", "")
+                if gemini_err:
+                    st.error(f"**Gemini error:** {gemini_err}")
                 st.error(
-                    "Gemini returned a response but it couldn't be parsed as "
-                    "JSON listings. This usually means one of:\n"
-                    "- Gemini wrote a long preamble before the JSON and ran "
-                    "out of tokens before completing the listings\n"
-                    "- The model returned prose instead of JSON\n"
-                    "- The suburb genuinely has no listings in this range "
-                    "(but Gemini phrased that as text rather than `[]`)\n\n"
-                    "**Try:** narrowing the price range; including state + "
-                    "postcode in the suburb; or trying again in a minute "
-                    "(model behaviour varies)."
+                    "The search couldn't complete. Possible causes:\n"
+                    "- **Rate limited** — wait 60 seconds and try again\n"
+                    "- **Daily quota exhausted** — `gemini-2.5-pro` is 100 RPD, "
+                    "`flash` is 250 RPD, `flash-lite` is 1000 RPD\n"
+                    "- **Empty / blocked response** — content filter or grounding "
+                    "issue (the error above will say `finish_reason` if so)\n"
+                    "- **Suburb has no current listings** in this price range — "
+                    "Gemini phrased it as prose instead of `[]`\n\n"
+                    "**Try:** wait a minute and click search again; widen the "
+                    "price range; include state + postcode in the suburb."
                 )
                 # Show the raw responses so we can see what actually came back
                 if data and data.get("_raw_attempts"):
                     with st.expander("🔍 Show raw Gemini response (for debugging)"):
                         for i, attempt in enumerate(data["_raw_attempts"], 1):
                             st.markdown(f"**Attempt {i}:**")
-                            st.code((attempt or "")[:5000], language="text")
+                            content = attempt or "(no response — Gemini call failed before producing text)"
+                            st.code(content[:5000], language="text")
                 return
             status.update(label="✅ Search complete", state="complete",
                           expanded=False)
