@@ -10,3 +10,17 @@ matplotlib>=3.7
 scikit-learn>=1.3
 trimesh>=4.0
 rtree>=1.0
+# Tested together on Python 3.12. Versions are the ones this was validated against.
+streamlit>=1.40            # tested 1.63.0
+opencv-python-headless>=4.9 # tested 4.13.0  (use opencv-python if you want cv2.imshow)
+numpy>=1.26                # tested 2.4.4
+shapely>=2.0               # tested 2.1.2   (2.x required: 1.x geometry API differs)
+trimesh>=4.0               # tested 5.1.0
+mapbox-earcut>=1.0         # polygon triangulation, ISC licence
+manifold3d>=2.3            # boolean CSG for door/window cutouts; optional
+plotly>=5.18               # tested 7.0.0
+pandas>=2.0                # room table and the openings editor
+pillow>=10.0               # image decoding
+
+# Deliberately NOT used: the `triangle` package. It wraps Shewchuk's Triangle,
+# which is free only for non-commercial use. mapbox-earcut is the safe default.
