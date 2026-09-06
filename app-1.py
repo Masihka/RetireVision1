@@ -1,345 +1,275 @@
 """
-Isovist Building Generator — Streamlit app.
+app.py - Floor plan to 3D model
+===============================
+Streamlit front end for floorplan_core. Run with:
 
-Generates 3 random building masses (axis-aligned boxes + optional setbacks
-and a cylindrical core), previews them in 3D with Plotly, and exports each
-as an ASCII STL file for downstream isovist modeling.
-
-Run:
-    pip install streamlit numpy plotly
     streamlit run app.py
+
+The UI's job is calibration and inspection. Automatic vectorisation of a raster
+plan is not a solved problem, so every stage is exposed and the wall mask is
+shown overlaid on the source: tuning against that overlay is the workflow, not
+an optional debugging step.
 """
 
 from __future__ import annotations
 
 import io
-import math
-import random
-import struct
-from dataclasses import dataclass
 
+import cv2
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from PIL import Image
+
+from floorplan_core import (
+    GeomParams,
+    Opening,
+    WallParams,
+    binarize,
+    build_scene,
+    cut_openings,
+    estimate_wall_thickness_px,
+    extract_walls,
+    mask_to_polygons,
+    rooms_from_walls,
+    scene_stats,
+    synthetic_plan,
+)
+
+st.set_page_config(page_title="Floor plan to 3D", layout="wide")
+
+MAX_FACES = 150_000  # above this Plotly's WebGL path gets sluggish
 
 
-# ---------------------------------------------------------------------------
-# Geometry primitives
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Mesh:
-    """Triangle soup. vertices: (N,3,3) array of triangle vertices."""
-    triangles: np.ndarray  # shape (N, 3, 3)
-
-    @property
-    def num_triangles(self) -> int:
-        return int(self.triangles.shape[0])
-
-    def bbox(self):
-        v = self.triangles.reshape(-1, 3)
-        return v.min(axis=0), v.max(axis=0)
-
-    def merge(self, other: "Mesh") -> "Mesh":
-        return Mesh(np.concatenate([self.triangles, other.triangles], axis=0))
+# --------------------------------------------------------------------------- #
+# Cached stages
+# --------------------------------------------------------------------------- #
 
 
-def box_mesh(w: float, h: float, d: float,
-             cx: float = 0.0, cy: float = 0.0, cz: float = 0.0) -> Mesh:
-    """Axis-aligned box centered at (cx, cy, cz)."""
-    x0, x1 = cx - w / 2, cx + w / 2
-    y0, y1 = cy - h / 2, cy + h / 2
-    z0, z1 = cz - d / 2, cz + d / 2
+@st.cache_data(show_spinner=False)
+def _load_gray(data: bytes, max_side: int) -> np.ndarray:
+    """Decode to grayscale and cap the long side.
 
-    # 8 corners
-    p = np.array([
-        [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
-        [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
-    ])
-    # 12 triangles (CCW outward)
-    faces = [
-        (0, 2, 1), (0, 3, 2),  # -Z
-        (4, 5, 6), (4, 6, 7),  # +Z
-        (0, 1, 5), (0, 5, 4),  # -Y (bottom)
-        (3, 6, 2), (3, 7, 6),  # +Y (top)
-        (0, 4, 7), (0, 7, 3),  # -X
-        (1, 2, 6), (1, 6, 5),  # +X
-    ]
-    tris = np.array([[p[a], p[b], p[c]] for (a, b, c) in faces])
-    return Mesh(tris)
-
-
-def cylinder_mesh(radius: float, height: float,
-                  cx: float = 0.0, cz: float = 0.0,
-                  y_base: float = 0.0, segments: int = 32) -> Mesh:
-    """Cylinder along Y axis, base at y_base."""
-    angles = np.linspace(0, 2 * np.pi, segments, endpoint=False)
-    bottom = np.stack([cx + radius * np.cos(angles),
-                       np.full_like(angles, y_base),
-                       cz + radius * np.sin(angles)], axis=1)
-    top = bottom.copy()
-    top[:, 1] = y_base + height
-
-    tris = []
-    cb = np.array([cx, y_base, cz])
-    ct = np.array([cx, y_base + height, cz])
-    for i in range(segments):
-        j = (i + 1) % segments
-        # side (two tris, outward CCW)
-        tris.append([bottom[i], bottom[j], top[j]])
-        tris.append([bottom[i], top[j], top[i]])
-        # bottom cap (CCW seen from below = clockwise from above)
-        tris.append([cb, bottom[j], bottom[i]])
-        # top cap
-        tris.append([ct, top[i], top[j]])
-    return Mesh(np.array(tris))
-
-
-# ---------------------------------------------------------------------------
-# Random building generator
-# ---------------------------------------------------------------------------
-
-def generate_building(rng: random.Random) -> tuple[Mesh, dict]:
+    Downscaling before morphology is not just for speed: structuring-element
+    sizes are in pixels, so a stable working resolution keeps one set of
+    parameters valid across a 150 DPI scan and a 600 DPI export.
     """
-    Build a random mass:
-      - 1..3 base box blocks (overlapping is allowed)
-      - 0..3 stacked setbacks on the tallest block
-      - 45% chance of a cylindrical tower
-    Returns merged mesh and a metadata dict.
-    """
-    base_extent = 12.0 + rng.random() * 18.0   # ~12..30 m
-    parts: list[Mesh] = []
-    block_info = []
-
-    n_blocks = rng.randint(1, 3)
-    for i in range(n_blocks):
-        w = base_extent * (0.4 + rng.random() * 0.8)
-        d = base_extent * (0.4 + rng.random() * 0.8)
-        h = 8.0 + rng.random() * 40.0
-        ox = 0.0 if i == 0 else (rng.random() - 0.5) * base_extent * 0.8
-        oz = 0.0 if i == 0 else (rng.random() - 0.5) * base_extent * 0.8
-        parts.append(box_mesh(w, h, d, ox, h / 2, oz))
-        block_info.append({"w": w, "h": h, "d": d, "ox": ox, "oz": oz})
-
-    tallest = max(block_info, key=lambda b: b["h"])
-    cur_h = tallest["h"]
-    n_setbacks = rng.randint(0, 3)
-    for _ in range(n_setbacks):
-        sw = tallest["w"] * (0.4 + rng.random() * 0.5)
-        sd = tallest["d"] * (0.4 + rng.random() * 0.5)
-        sh = 4.0 + rng.random() * 12.0
-        sox = tallest["ox"] + (rng.random() - 0.5) * (tallest["w"] - sw) * 0.6
-        soz = tallest["oz"] + (rng.random() - 0.5) * (tallest["d"] - sd) * 0.6
-        parts.append(box_mesh(sw, sh, sd, sox, cur_h + sh / 2, soz))
-        cur_h += sh
-
-    has_cyl = rng.random() < 0.45
-    if has_cyl:
-        r = 2.0 + rng.random() * 4.0
-        ch = 6.0 + rng.random() * 30.0
-        cx = (rng.random() - 0.5) * base_extent * 0.5
-        cz = (rng.random() - 0.5) * base_extent * 0.5
-        parts.append(cylinder_mesh(r, ch, cx, cz, y_base=0.0, segments=28))
-
-    mesh = parts[0]
-    for p in parts[1:]:
-        mesh = mesh.merge(p)
-
-    mn, mx = mesh.bbox()
-    meta = {
-        "footprint": (float(mx[0] - mn[0]), float(mx[2] - mn[2])),
-        "height": float(mx[1] - mn[1]),
-        "blocks": n_blocks,
-        "setbacks": n_setbacks,
-        "cylinder": has_cyl,
-        "triangles": mesh.num_triangles,
-    }
-    return mesh, meta
+    img = Image.open(io.BytesIO(data))
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGBA")
+        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(bg, img)
+    gray = np.array(img.convert("L"))
+    h, w = gray.shape
+    if max(h, w) > max_side:
+        s = max_side / max(h, w)
+        gray = cv2.resize(gray, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+    return gray
 
 
-# ---------------------------------------------------------------------------
-# STL writers
-# ---------------------------------------------------------------------------
-
-def _triangle_normals(tris: np.ndarray) -> np.ndarray:
-    a = tris[:, 0, :]
-    b = tris[:, 1, :]
-    c = tris[:, 2, :]
-    n = np.cross(b - a, c - a)
-    lengths = np.linalg.norm(n, axis=1, keepdims=True)
-    lengths[lengths == 0] = 1.0
-    return n / lengths
+@st.cache_data(show_spinner=False)
+def _masks(gray: np.ndarray, wp: WallParams) -> tuple[np.ndarray, np.ndarray]:
+    bw = binarize(gray, wp)
+    return bw, extract_walls(bw, wp)
 
 
-def mesh_to_stl_ascii(mesh: Mesh, name: str = "building") -> bytes:
-    tris = mesh.triangles
-    normals = _triangle_normals(tris)
-    out = [f"solid {name}"]
-    for n, t in zip(normals, tris):
-        out.append(f"facet normal {n[0]:.6e} {n[1]:.6e} {n[2]:.6e}")
-        out.append("  outer loop")
-        for v in t:
-            out.append(f"    vertex {v[0]:.6e} {v[1]:.6e} {v[2]:.6e}")
-        out.append("  endloop")
-        out.append("endfacet")
-    out.append(f"endsolid {name}")
-    return ("\n".join(out)).encode("utf-8")
+@st.cache_data(show_spinner=False)
+def _vectorise(wall: np.ndarray, gp: GeomParams):
+    return mask_to_polygons(wall, gp), rooms_from_walls(wall, gp)
 
 
-def mesh_to_stl_binary(mesh: Mesh) -> bytes:
-    tris = mesh.triangles.astype(np.float32)
-    normals = _triangle_normals(tris).astype(np.float32)
-    n_tri = tris.shape[0]
-    buf = io.BytesIO()
-    buf.write(b"\x00" * 80)                       # header
-    buf.write(struct.pack("<I", n_tri))           # triangle count
-    for n, t in zip(normals, tris):
-        buf.write(struct.pack("<3f", *n))
-        buf.write(struct.pack("<3f", *t[0]))
-        buf.write(struct.pack("<3f", *t[1]))
-        buf.write(struct.pack("<3f", *t[2]))
-        buf.write(struct.pack("<H", 0))           # attribute byte count
-    return buf.getvalue()
+# --------------------------------------------------------------------------- #
+# Rendering
+# --------------------------------------------------------------------------- #
 
 
-# ---------------------------------------------------------------------------
-# Plotly preview
-# ---------------------------------------------------------------------------
+def overlay(gray: np.ndarray, wall: np.ndarray) -> np.ndarray:
+    """Source plan with detected walls tinted red."""
+    rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+    tint = rgb.copy()
+    tint[wall > 0] = (220, 40, 40)
+    return cv2.addWeighted(rgb, 0.45, tint, 0.55, 0)
 
-def mesh_figure(mesh: Mesh, title: str) -> go.Figure:
-    tris = mesh.triangles
-    verts = tris.reshape(-1, 3)
-    n = tris.shape[0]
-    i = np.arange(0, 3 * n, 3)
-    j = i + 1
-    k = i + 2
 
-    fig = go.Figure(data=[
-        go.Mesh3d(
-            x=verts[:, 0], y=verts[:, 2], z=verts[:, 1],   # swap to put Y up
-            i=i, j=j, k=k,
-            color="#e8e6df",
-            flatshading=True,
-            lighting=dict(ambient=0.4, diffuse=0.8, specular=0.1, roughness=0.8),
-            lightposition=dict(x=100, y=100, z=200),
-            opacity=1.0,
+def scene_to_plotly(scene) -> go.Figure:
+    fig = go.Figure()
+    for name, geom in scene.geometry.items():
+        v, f = geom.vertices, geom.faces
+        try:
+            r, g, b = geom.visual.face_colors[0][:3]
+        except Exception:
+            r, g, b = 190, 190, 195
+        fig.add_trace(
+            go.Mesh3d(
+                x=v[:, 0], y=v[:, 1], z=v[:, 2],
+                i=f[:, 0], j=f[:, 1], k=f[:, 2],
+                color=f"rgb({r},{g},{b})",
+                flatshading=True,
+                name=name,
+                hoverinfo="name",
+                lighting=dict(ambient=0.55, diffuse=0.85, specular=0.08, roughness=0.9),
+                lightposition=dict(x=100, y=200, z=300),
+            )
         )
-    ])
-    mn, mx = mesh.bbox()
-    size = max(mx[0] - mn[0], mx[2] - mn[2], mx[1] - mn[1])
     fig.update_layout(
-        title=dict(text=title, font=dict(size=12)),
+        height=680,
+        margin=dict(l=0, r=0, t=0, b=0),
         scene=dict(
-            xaxis=dict(title="X (m)", showbackground=False),
-            yaxis=dict(title="Z (m)", showbackground=False),
-            zaxis=dict(title="Y / height (m)", showbackground=False),
-            aspectmode="data",
-            camera=dict(eye=dict(x=1.6, y=1.6, z=1.0)),
+            aspectmode="data",  # metres are metres on all three axes
+            xaxis_title="x (m)", yaxis_title="y (m)", zaxis_title="z (m)",
+            camera=dict(eye=dict(x=1.6, y=-1.6, z=1.2)),
         ),
-        margin=dict(l=0, r=0, t=30, b=0),
-        height=420,
-        paper_bgcolor="#0d0e10",
-        font=dict(color="#e8e6df"),
+        showlegend=False,
     )
     return fig
 
 
-# ---------------------------------------------------------------------------
-# Streamlit UI
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# Sidebar
+# --------------------------------------------------------------------------- #
 
-st.set_page_config(page_title="Isovist Building Generator", layout="wide")
+st.sidebar.header("Source")
+upload = st.sidebar.file_uploader("Floor plan image", type=["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"])
+demo = st.sidebar.toggle("Use the built-in demo plan", value=upload is None)
 
-st.markdown(
-    """
-    <style>
-      .block-container {padding-top: 1.5rem;}
-      h1 {letter-spacing: .15em; font-size: 1.4rem !important;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+max_side = st.sidebar.select_slider("Working resolution (px)", [800, 1200, 1600, 2000, 2600], value=1600)
 
-st.title("ISOVIST · BUILDING GENERATOR")
-st.caption("3 random building masses · STL export for isovist modeling")
+if demo:
+    gray = synthetic_plan(50.0)
+    if max(gray.shape) > max_side:
+        s = max_side / max(gray.shape)
+        gray = cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+elif upload is not None:
+    gray = _load_gray(upload.getvalue(), max_side)
+else:
+    st.title("Floor plan to 3D")
+    st.info("Upload a floor plan image, or switch on the demo plan to see the pipeline run.")
+    st.stop()
 
-with st.sidebar:
-    st.header("Parameters")
-    seed_input = st.text_input("Seed", value=st.session_state.get("seed", "ALPHA01"))
-    fmt = st.radio("STL format", ["ASCII", "Binary"], index=1, horizontal=True)
-    if st.button("↻ Regenerate (random seed)", use_container_width=True):
-        st.session_state["seed"] = "".join(
-            random.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(7)
+H, W = gray.shape
+
+st.sidebar.header("Wall detection")
+dark_ink = st.sidebar.toggle("Walls are dark on a light page", value=True)
+adaptive = st.sidebar.toggle("Adaptive threshold", value=False,
+                             help="Turn on for photos or scans with uneven lighting. Otsu is better for clean exports.")
+block = st.sidebar.slider("Adaptive window (px)", 11, 151, 35, 2, disabled=not adaptive)
+C = st.sidebar.slider("Adaptive bias", -20, 40, 10, disabled=not adaptive)
+axis_aligned = st.sidebar.toggle("Orthogonal walls only", value=True,
+                                 help="Keeps horizontal and vertical runs and discards everything else, which removes text and furniture. Switch off for diagonal or curved walls.")
+min_line_px = st.sidebar.slider("Shortest wall run (px)", 5, 200, 40, disabled=not axis_aligned)
+min_thick_px = st.sidebar.slider("Thinnest wall (px)", 0, 31, 0,
+                                 help="Discards strokes thinner than this, which removes hatching and stair treads. Leave at 0 for hollow double-line walls: it runs before gap closing and would erase them.")
+close_px = st.sidebar.slider("Gap closing (px)", 0, 41, 5,
+                             help="Set a little above the drawn wall thickness and no higher. Too high and dimension lines get bridged into the walls, which nothing downstream can undo.")
+min_blob_px = st.sidebar.slider("Smallest kept blob (px)", 0, 5000, 200, 50)
+
+wp = WallParams(dark_ink=dark_ink, adaptive=adaptive, block=block, C=C,
+                axis_aligned=axis_aligned, min_line_px=min_line_px,
+                close_px=close_px, min_thick_px=min_thick_px, min_blob_px=min_blob_px)
+
+bw, wall = _masks(gray, wp)
+
+# --- scale -----------------------------------------------------------------
+st.sidebar.header("Scale")
+ys, xs = np.nonzero(wall)
+span_px = float(xs.max() - xs.min()) if xs.size else float(W)
+mode = st.sidebar.radio("Calibrate by", ["Overall width", "Pixels per metre"], horizontal=True)
+if mode == "Overall width":
+    known_m = st.sidebar.number_input("Real width of the detected plan (m)", 1.0, 500.0, 10.2, 0.1,
+                                      help=f"The detected walls span {span_px:.0f} px horizontally.")
+    px_per_m = span_px / max(known_m, 1e-6)
+    st.sidebar.caption(f"{px_per_m:.1f} px/m")
+else:
+    px_per_m = st.sidebar.number_input("Pixels per metre", 1.0, 2000.0, 50.0, 1.0)
+
+st.sidebar.header("3D")
+wall_h = st.sidebar.slider("Wall height (m)", 2.0, 6.0, 2.7, 0.05)
+floor_t = st.sidebar.slider("Floor thickness (m)", 0.0, 0.5, 0.12, 0.01)
+eps_rel = st.sidebar.select_slider("Contour simplification",
+                                   [0.0005, 0.001, 0.002, 0.004, 0.008, 0.016], value=0.002,
+                                   help="Douglas-Peucker tolerance as a fraction of each contour's perimeter. Higher means fewer triangles and squarer walls.")
+min_room = st.sidebar.slider("Smallest room (m²)", 0.5, 20.0, 1.5, 0.5)
+show_floor = st.sidebar.toggle("Show floor slabs", value=True)
+
+gp = GeomParams(px_per_m=px_per_m, eps_rel=eps_rel, wall_height_m=wall_h,
+                floor_thickness_m=floor_t, min_room_area_m2=min_room)
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+st.title("Floor plan to 3D")
+
+walls, rooms = _vectorise(wall, gp)
+t_m = estimate_wall_thickness_px(wall) / px_per_m
+total_area = sum(a for _, a in rooms)
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Wall parts", len(getattr(walls, "geoms", [])))
+c2.metric("Rooms", len(rooms))
+c3.metric("Enclosed area", f"{total_area:.1f} m²")
+c4.metric("Wall thickness", f"{t_m:.2f} m", help="Modal scanline run length. Reads 1-2 px high because thresholding widens the ink edge. A wildly wrong value means the scale is wrong.")
+
+tab_check, tab_3d, tab_rooms, tab_export = st.tabs(["Check the mask", "3D model", "Rooms", "Export"])
+
+with tab_check:
+    st.caption("Tune the sidebar until the red overlay covers the walls and nothing else. Everything downstream inherits this mask.")
+    a, b = st.columns(2)
+    a.image(overlay(gray, wall), caption="Detected walls over the source", width="stretch")
+    b.image(bw, caption="Threshold output, before the wall sieve", width="stretch")
+    if len(getattr(walls, "geoms", [])) == 0:
+        st.warning("No walls survived. Lower the smallest-blob and shortest-run sliders, or switch off orthogonal-walls-only.")
+    if len(rooms) == 0:
+        st.warning("No enclosed rooms. Raise gap closing until the wall loop is continuous, or lower the smallest-room threshold.")
+
+with tab_3d:
+    with st.expander("Doors and windows", expanded=False):
+        st.caption("Openings are cut, not detected. Give the centre in metres in the same frame as the axes below; angle 0 means the wall runs along x.")
+        seed = pd.DataFrame([{"x": 0.0, "y": 0.0, "width": 0.9, "height": 2.05,
+                              "sill": 0.0, "angle_deg": 0.0}]).iloc[0:0]
+        table = st.data_editor(seed, num_rows="dynamic", width="stretch", key="openings")
+
+    scene = build_scene(walls, rooms, gp, include_floor=show_floor)
+    warns: list[str] = []
+    if len(table):
+        scene, warns = cut_openings(scene, [Opening(**r) for r in table.to_dict("records")])
+    for w_ in warns:
+        st.warning(f"Boolean cut skipped: {w_}")
+
+    stats = scene_stats(scene)
+    if stats["faces"] > MAX_FACES:
+        st.warning(f"{stats['faces']:,} triangles will render slowly. Raise contour simplification.")
+    if stats["parts"] == 0:
+        st.info("Nothing to show yet. Fix the mask first.")
+    else:
+        st.plotly_chart(scene_to_plotly(scene), width="stretch")
+        st.caption(f"{stats['parts']} parts · {stats['faces']:,} triangles · bounding box {stats['bbox_m']} m")
+
+with tab_rooms:
+    if rooms:
+        df = pd.DataFrame(
+            [{"Room": f"{i + 1}", "Area (m²)": round(a, 2),
+              "Perimeter (m)": round(p.length, 2),
+              "Centroid x (m)": round(p.centroid.x, 2),
+              "Centroid y (m)": round(p.centroid.y, 2)}
+             for i, (p, a) in enumerate(rooms)]
         )
-        st.rerun()
-    st.session_state["seed"] = seed_input
-    st.divider()
-    st.markdown(
-        "**Notes**\n\n"
-        "- Units are meters. STL has no unit metadata; import as meters.\n"
-        "- Geometry is a triangle soup of overlapping primitives (not boolean-unioned). "
-        "Fine for 2D isovists at a given eye height; for strict watertight 3D "
-        "isovists, run a boolean union in Blender/Rhino first.\n"
-        "- Y is up. Plotly preview swaps axes so the building stands upright."
-    )
+        st.dataframe(df, width="stretch", hide_index=True)
+        st.caption("Areas are of the enclosed free space, measured to the inside wall faces. A doorway drawn as a full gap merges two rooms into one entry.")
+    else:
+        st.info("No enclosed rooms detected. Raise gap closing in the sidebar.")
 
-seed = st.session_state["seed"] or "DEFAULT"
-
-# Deterministic per-building RNGs
-buildings = []
-for i in range(3):
-    rng = random.Random(f"{seed}-{i}")
-    mesh, meta = generate_building(rng)
-    buildings.append((mesh, meta))
-
-cols = st.columns(3)
-labels = ["A", "B", "C"]
-for col, label, (mesh, meta) in zip(cols, labels, buildings):
-    with col:
-        st.plotly_chart(
-            mesh_figure(mesh, f"Building {label}"),
-            use_container_width=True,
-            config={"displayModeBar": False},
-        )
-        fp = meta["footprint"]
-        st.markdown(
-            f"**Building {label}**  \n"
-            f"Footprint: `{fp[0]:.1f} × {fp[1]:.1f} m`  \n"
-            f"Height: `{meta['height']:.1f} m`  \n"
-            f"Masses: {meta['blocks']} block(s), {meta['setbacks']} setback(s)"
-            f"{', cylinder' if meta['cylinder'] else ''}  \n"
-            f"Triangles: {meta['triangles']}"
-        )
-        if fmt == "ASCII":
-            data = mesh_to_stl_ascii(mesh, name=f"building_{label}")
-            mime = "model/stl"
-        else:
-            data = mesh_to_stl_binary(mesh)
-            mime = "application/octet-stream"
-        st.download_button(
-            label=f"⬇ Download Building {label} STL",
-            data=data,
-            file_name=f"building_{label}_{seed}.stl",
-            mime=mime,
-            use_container_width=True,
-        )
-
-st.divider()
-
-# Bundle all 3 as a zip
-import zipfile
-zbuf = io.BytesIO()
-with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
-    for label, (mesh, _) in zip(labels, buildings):
-        if fmt == "ASCII":
-            z.writestr(f"building_{label}_{seed}.stl",
-                       mesh_to_stl_ascii(mesh, name=f"building_{label}"))
-        else:
-            z.writestr(f"building_{label}_{seed}.stl",
-                       mesh_to_stl_binary(mesh))
-st.download_button(
-    "⬇ Download all 3 STL files (.zip)",
-    data=zbuf.getvalue(),
-    file_name=f"buildings_{seed}.zip",
-    mime="application/zip",
-)
+with tab_export:
+    if stats["parts"] == 0:
+        st.info("Build a model first.")
+    else:
+        st.caption("glTF keeps the per-room colours and is the right choice for Blender, three.js and most viewers. OBJ and STL are geometry only.")
+        e1, e2, e3 = st.columns(3)
+        e1.download_button("Download .glb", scene.export(file_type="glb"),
+                           "floorplan.glb", "model/gltf-binary", width="stretch")
+        obj = scene.export(file_type="obj")
+        e2.download_button("Download .obj", obj if isinstance(obj, bytes) else obj.encode(),
+                           "floorplan.obj", "text/plain", width="stretch")
+        e3.download_button("Download .stl", scene.export(file_type="stl"),
+                           "floorplan.stl", "model/stl", width="stretch")
